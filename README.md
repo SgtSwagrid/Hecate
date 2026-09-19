@@ -1,156 +1,280 @@
 <div align="center">
-  <h1>📚 Scala Library Template</h1>
-  <p>A reusable template for Scala libraries deployed to <a href="https://central.sonatype.com/">Maven Central</a>.</p>
-</div>
 
-<br><br>
+  <h1>🗝️ Hecate</h1>
+  <p>User accounts, sessions, groups and permissions for full stack <a href="https://www.scala-lang.org/">Scala</a> websites.</p>
 
-> "Perfection is achieved not when there is nothing more to add, but when there is nothing left to take away." — Antoine de Saint-Exupéry.
-
-<br>
-
-## 📋 What's included?
-
-1. Everything from [Scala Library Config](https://github.com/SgtSwagrid/scala-library-config), including reasonable [Scalafmt](https://scalameta.org/scalafmt/) settings, CI piplines for build integrity, and some IDE config.
-2. Automatic deployment to Maven Central using [sbt-ci-release](https://github.com/sbt/sbt-ci-release).
-3. Example build configuration and setup instructions.
-
-## 🔨 How to use this template
-
-### 1. Create your repository
-
-Click '[**Use this template**](https://github.com/new?template_name=scala-library-template&template_owner=SgtSwagrid)' on GitHub, and follow the instructions to create a new repository for your library.
-All files herein will be copied as-is.
-
-### 2. Configure [build.sbt](build.sbt) and [release.sbt](release.sbt)
-
-Replace every placeholder with real values for your project.
-The sbt settings necessary for publishing are defined by `sbt-ci-release` and are documented [here](https://github.com/sbt/sbt-ci-release?tab=readme-ov-file#sbt).
-
-#### Settings to update in `release.sbt`:
-
-| Name | Purpose | Example |
-| ---- | ------- | ------- |
-| `organization` | Your organisation's package namespace. | `org.nohungrydogs` |
-| `organizationName` | Your organisation's name. | `No Hungry Dogs` |
-| `organizationHomepage` | Your organisation's website. | `nohungrydogs.org` |
-| [`versionScheme`](https://www.scala-sbt.org/1.x/docs/Publishing.html#Version+scheme) | What does the version number say about binary compatibility? | `strict` |
-| `licenses` | The license under which your library is released. Update [`LICENSE.md`](LICENSE.md) to match. | [`MIT`](https://opensource.org/license/mit) |
-| `developers` | The individual developers who contribute to your library. | `SgtSwagrid` |
-
-#### Settings to update in `build.sbt`:
-
-| Name | Purpose | Example |
-| ---- | ------- | ------- |
-| `packagePrefix` | IntelliJ's implicit package prefix for all code files. | `org.nohungrydogs` |
-| Name of subproject (following `lazy val`) | Your library's name, or the name of a particular module. | `dog-food-finder` |
-
-#### Multiple modules
-
-Each subproject listed in `build.sbt` is published as a separate artefact on Maven (albeit under the same versioning),
-which is useful if you want a modular design whereby downstream users need not include all facets of your library.
-Typically in this case you'll introduce one top-level subdirectory for each subproject.
-
-#### A note on sbt settings
-
-Settings are read from every `.sbt` file in the project root.
-It doesn't matter what they are called, other than that sbt simply concatenates their contents in alphabetical order of their names.
-A division between build information and publishing information is introduced for convenience.
-
-### 3. Set up your Maven Central account
-
-1. Create an account on [Maven Central](https://central.sonatype.com) to enable publishing, if you don't already have one.
-2. [Register](https://central.sonatype.com/publishing/namespaces) your namespace (e.g. `org.nohungrydogs`).
-   This should match the `organization` setting in `release.sbt`.
-3. [Generate](https://central.sonatype.com/usertoken) a user token.
-   This will give you a username and password, which you can add as repository secrets (see [step 5](#5-add-repository-secrets)).
-
-### 4. Generate a PGP key for signing releases
-
-Execute the following on your local machine to generate a [PGP](https://en.wikipedia.org/wiki/Pretty_Good_Privacy) key:
-
-```bash
-# Generate a new PGP key, making sure to remember your passphrase:
-gpg --gen-key
-
-# Expose the secret key in base64, using the public key provided by the above:
-gpg --armor --export-secret-keys <PUBLIC_KEY> | base64
-
-# Upload the public key to a keyserver:
-gpg --keyserver keyserver.ubuntu.com --send-keys <PUBLIC_KEY>
-```
-
-### 5. Add repository secrets
-
-Add the following secrets to your repository on GitHub, to allow publishing as part of an automated workflow:
-
-| Secret                    | Value                                                                                                               |
-|---------------------------|---------------------------------------------------------------------------------------------------------------------|
-| `SONATYPE_USERNAME`       | Username from Maven user token in [step 3](#3-set-up-your-maven-central-account).                                   |
-| `SONATYPE_PASSWORD`       | Password from Maven user token in [step 3](#3-set-up-your-maven-central-account).                                   |
-| `PGP_SECRET`              | Base64-encoded PGP private key from [step 4](#4-generate-a-pgp-key-for-signing-releases).                           |
-| `PGP_PASSPHRASE`          | Passphrase used when generating the PGP key in [step 4](#4-generate-a-pgp-key-for-signing-releases).                |
-| `GH_TOKEN`                | Your GitHub [PAT](https://github.com/settings/personal-access-tokens) with administrator to access your repository. |
-| `CLAUDE_CODE_OAUTH_TOKEN` | API key from [Claude](https://claude.com/product/claude-code) for agentic workflows (optional).                     |
-
-Secrets can be added from the GitHub web interface by nagivating as follows from your repository's page:
-
-> **Settings → Secrets and variables → Actions**
-
-### 6. Publish the Scaladoc documentation with Github Pages
-
-This project is configured to automatically extract and publish all [Scaladoc](https://docs.scala-lang.org/style/scaladoc.html) content
-as a stand-alone website using [GitHub Pages](https://pages.github.com/).
-
-All you need to do is configure GitHub to deploy the site from the branch named `gh-pages`,
-which will be automatically created following the first release.
-You can find this setting under:
-
-> **Settings → Pages**
-
-## 👮‍♂️ License
-
-The included MIT license should be considered only as part of the template, and is not binding.
-This repository is hereby released to the public domain, to be used freely.
-In particular, and contra [LICENSE.md](LICENSE.md), you may remove the license text from copies.
-
-## 🤝 Contributing
-
-[CONTRIBUTING.md](CONTRIBUTING.md) is also part of the template, and does not _necessarily_ apply to contributions to the template itself.
-The most important thing to know is that many of the configuration files are automatically synced from [Scala Config](https://github.com/SgtSwagrid/scala-config), and should be updated there rather than here.
-
-## 👁️ See also
-
-- Check out [Scala Website Template](https://github.com/SgtSwagrid/scala-website-template) for a similar template to quickly start a new full stack website in Scala.
-- This project is configured by [Scala Library Config](https://github.com/SgtSwagrid/scala-library-config).
-
-<br/><br/><br/><br/>
-<h3 align="center">⬆️ Delete • Keep ⬇️</h3>
-<br/><br/><br/><br/>
-
-<div align="center">
-
-  <h1>✨ My Library</h1>
-  <p>A very cool Scala library that does something great.</p>
-  
-  <!-- Update the following URLS to show live build status in your README. -->
   <span>
-    <a href="https://github.com/SgtSwagrid/scala-library-template/actions/workflows/build-integrity.yml"><img src="https://github.com/SgtSwagrid/scala-library-template/actions/workflows/build-integrity.yml/badge.svg" alt="Build status" /></a>
-    <a href="https://search.maven.org/artifact/com.alecdorrington/scala-library-template_3"><img src="https://img.shields.io/maven-central/v/com.alecdorrington/scala-library-template_3.svg" alt="Maven Central" /></a>
-    <a href="https://alecdorrington.com/scala-library-template"><img src="https://img.shields.io/badge/docs-latest-blue.svg" alt="Documentation" /></a>
+    <a href="https://github.com/SgtSwagrid/Hecate/actions/workflows/build-integrity.yml"><img src="https://github.com/SgtSwagrid/Hecate/actions/workflows/build-integrity.yml/badge.svg" alt="Build status" /></a>
+    <a href="https://search.maven.org/artifact/com.alecdorrington/hecate-core_3"><img src="https://img.shields.io/maven-central/v/com.alecdorrington/hecate-core_3.svg" alt="Maven Central" /></a>
+    <a href="https://alecdorrington.com/Hecate"><img src="https://img.shields.io/badge/docs-latest-blue.svg" alt="Documentation" /></a>
   </span>
-  
+
 </div>
+
+> [!WARNING]
+> Hecate is in beta. It is young, it has one user, and anything may change between minor versions.
+
+A library for user accounts, sign-in sessions, nestable user groups, and the permissions that people
+and groups hold over whatever your application calls a resource.
+It knows nothing of the application it serves: it opens no database, fixes no JDBC profile, and renders nothing.
+
+Named for [Hecate](https://en.wikipedia.org/wiki/Hecate), keeper of keys and guardian of gates and crossroads.
 
 ## ⬇️ Installation
 
-Add the following dependency to your `build.sbt`:
+Add whichever halves you need to your `build.sbt`:
 
-<!-- Replace with the details for your own library. -->
 ```scala
-libraryDependencies += "com.alecdorrington" %% "scala-library-template" % "0.2.1"
+libraryDependencies += "com.alecdorrington" %% "hecate-server" % "0.1.0" // On the JVM.
+libraryDependencies += "com.alecdorrington" %% "hecate-client" % "0.1.0" // In the browser.
 ```
+
+Compiled with Scala `3.8.4`, with no intention to explicitly support older versions.
+
+## 🏯 Layout
+
+| Module | Platform | Contents |
+|--------|----------|----------|
+| [`hecate-core`](core)     | JVM + JS | The model, and the API endpoint definitions.      |
+| [`hecate-server`](server) | JVM      | Password hashing, persistence, and the endpoints. |
+| [`hecate-client`](client) | JS       | Headless browser-side state.                      |
+
+A host application uses the server half, the client half, or both;
+the shared half comes with either, so the two agree on the wire format by construction.
+
+## Server
+
+Wire it up by handing the library a database to use. It opens nothing itself:
+
+```scala
+import com.alecdorrington.hecate.server.*
+import slick.jdbc.H2Profile
+
+// Your database handle, implementing `def run[X](action: DBIO[X]): IO[X]`.
+class MyDb(...) extends Transactor
+
+val tables = AuthTables(H2Profile) // Or any other JDBC profile.
+val auth   = AuthService(UserStore(tables, db))
+val groups = GroupService(GroupStore(tables, db), auth)
+
+// On startup, alongside your own schema creation:
+db.run(tables.createIfNotExists)
+
+// Serve them with the rest of your endpoints:
+val endpoints = auth.api ++ groups.api ++ myOwnEndpoints
+```
+
+`AuthTables` is parameterised on the Slick profile, so the library is not bound to any
+one database. Pass `prefix` if its tables need to sit in a namespace of their own.
+
+### Securing your own endpoints
+
+Build an endpoint on `AuthApi.secured` and give it `AuthService.require` as its security
+logic. The `Caller` is then the first argument of the endpoint's logic: the signed-in `User`,
+with the language their request asked to be answered in.
+
+```scala
+import com.alecdorrington.hecate.api.AuthApi
+
+val myEndpoint = AuthApi.secured.get.in("api" / "things").out(jsonBody[List[Thing]])
+
+myEndpoint
+  .serverSecurityLogic(auth.require)
+  .serverLogic(caller => _ => thingsOwnedBy(caller.id))
+```
+
+Sessions live in an HTTP-only, `SameSite=Strict` cookie, and expire in the store as well
+as in the browser, so a leaked token cannot outlive its expiry. Passwords are stored as
+salted PBKDF2 hashes, compared in constant time; an unknown username is checked against a
+decoy hash so that sign-in takes the same time whether or not the account exists.
+
+Tune the session lifetime and the password rules with `AuthPolicy`:
+
+```scala
+AuthService(users, AuthPolicy(sessionSeconds = 3600, minPasswordLength = 12))
+```
+
+### Speaking the user's language
+
+The library never writes a sentence of its own choosing. Every refusal is an `AuthRefusal`,
+and a `Wording` turns one into a sentence; `Wording.english` is the only one the library
+carries. To answer in more languages, implement `Wording` once per language and hand
+`AuthService` and `GroupService` a function from the request's language to the wording it
+should use:
+
+```scala
+AuthService(users, wording = locale => myStrings(locale))
+GroupService(groups, auth, wording = locale => myStrings(locale))
+```
+
+The language reaches you as the value of a `language` cookie, which the client sets for its
+whole origin: a language code (`de`) or a locale tag (`de-AT`), or `None` when the request
+names none. Endpoints built on `AuthApi.secured` read it alongside the session cookie, and
+`register`, `login` and `recover` read it too, so a refusal is worded for its reader even
+before anyone is signed in. `Caller.locale` carries it into your own endpoints, for wording
+your application's own refusals the same way. `AuthProblem.getMessage` stays English,
+for logs.
+
+### Groups
+
+Groups are owned by the user who creates them, visible only to that owner, and nest to
+arbitrary depth through `Group.parent`. Membership propagates *upwards*: a member of a
+group is effectively a member of every group it is nested inside, so anything addressed
+to a department also reaches the members of each team within it. `GroupStore.groupIdsOf`
+returns exactly that set, and is the intended basis for "what may this user see?".
+
+Deleting a group deletes every group beneath it. To delete whatever your application
+attaches to a group in the same transaction, pass a cascade:
+
+```scala
+GroupStore(tables, db, ids => myTable.filter(_.groupId inSet ids).delete.map(_ => ()))
+```
+
+The cascade runs before the groups themselves are removed, so it may still join on them.
+
+### Accounts
+
+Users can change their password, recover a forgotten one, and delete their account.
+
+**Changing a password** needs the current password. It signs out every other session the
+user had and gives this one a fresh session, so anyone who knew the old password is
+signed out along with them.
+
+**Recovery** needs no email and no administrator. A signed-in user generates a set of ten
+one-time recovery codes, after giving their password again, and writes them down; the
+server keeps only their hashes and never shows them again. A user who forgets their
+password gives their username, one unused code and a new password, and is signed in.
+Each code works once, and generating a new set invalidates the old one. A failed
+recovery never says whether the username or the code was wrong.
+
+**Deleting an account** needs the password, and removes everything that belongs to the
+user in one transaction: their sessions and recovery codes, the groups they own (with
+those groups' members, invitations and grants), their memberships and invitations
+elsewhere, the grants they hold, and whatever the host application attaches to them.
+It is refused while the user, with the groups they own, is the only owner of some resource,
+which would otherwise be left owned by nobody; they must first pass it on or delete it.
+It is off unless the host application passes an `AccountStore`:
+
+```scala
+val groups   = GroupStore(tables, db, cascade)
+val grants   = GrantStore(tables, db)
+val accounts = AccountStore(tables, db, users, groups, grants, cascade)
+val auth     = AuthService(users, accounts = Some(accounts))
+
+// One cascade for both: the groups of a deleted subtree, or a deleted user.
+def cascade(principals: Seq[Principal]): DBIO[Unit] = ...
+```
+
+Pass it only once the cascade removes everything of the host's that points at a user.
+Until then the endpoint is not served, and `GET /api/auth/rules` reports
+`accountDeletion: false` so that clients hide the option.
+
+`GET /api/auth/rules` also reports the minimum password length, so that a form can state
+the rule before a password is refused rather than after.
+
+### Permissions
+
+A grant gives a `Principal` (a `Person` or a `Group`) one level of `Access` over a
+`Resource`: `View`, `Edit` or `Own`, each including those below it. Resources are named in
+your application's terms, as a kind and an identifier, so the library never knows what they are.
+
+```scala
+val grants      = GrantStore(tables, db)
+val permissions = Permissions(groups, grants)
+
+// In the transaction that creates the thing, so that it is never left without an owner:
+grants.grant(Grant(Resource("document", id), Principal.Person(creator), Access.Own))
+
+permissions.access(user, Resource("document", id)) // The highest access reaching the user.
+permissions.visible(user, "document", Access.View)  // Every document they may see.
+```
+
+A grant to a group reaches every member of it and of every group nested inside it, but never
+the other way round. `GrantStore`'s writes are returned as actions rather than run, so that
+they can join the transaction that creates or deletes the resource; lock the resource's own
+row before granting or revoking, as nothing else can.
+
+Two small types carry access to the client: `Permitted` pairs a value with the access its
+reader holds over it, and `Gated` marks one part of a resource as shown, absent, or
+withheld from this reader, which are never to be conflated.
+
+### Whom a user may address
+
+`GroupStore.addressable(user)` lists the principals a user may give something to (a document,
+access): themselves, every group they own, and every member of those groups. Invitees
+are excluded, as the relation must be one the recipient consented to and can end.
+`GroupStore.mayAddress(user, principal)` answers the same question for one principal in
+a single query.
+
+## Client
+
+`AuthState` and `GroupsState` are headless: they expose signals and commands, and your
+application owns every pixel.
+
+```scala
+import com.alecdorrington.hecate.client.{AuthState, GroupsState}
+
+val auth   = AuthState() // Or AuthState(myWording) to speak another language.
+val groups = GroupsState(auth)
+
+auth.signIn("alice", "hunter2222")
+div(child <-- auth.user.map {
+  case Some(user) => span(s"Signed in as ${ user.username }")
+  case None       => signInForm(auth)
+})
+```
+
+`AuthState.user` changes on startup, sign-in and sign-out, so other state can follow it to
+refetch whatever belongs to the user. Until `AuthState.ready` is `true` nothing is known
+yet, and a `None` user must not be read as "signed out". `GroupsState.forest` nests the
+server's flat group list for rendering.
+
+## API
+
+| Method   | Path                                    | Purpose                                   |
+|----------|-----------------------------------------|-------------------------------------------|
+| `POST`   | `/api/auth/register`                    | Create an account and sign in.            |
+| `POST`   | `/api/auth/login`                       | Sign in.                                  |
+| `POST`   | `/api/auth/logout`                      | Sign out.                                 |
+| `GET`    | `/api/auth/me`                          | Identify the signed-in user.              |
+| `GET`    | `/api/auth/rules`                       | Describe the rules for accounts.          |
+| `PUT`    | `/api/auth/password`                    | Change your password.                     |
+| `GET`    | `/api/auth/recovery-codes`              | Count your unused recovery codes.         |
+| `POST`   | `/api/auth/recovery-codes`              | Generate new recovery codes.              |
+| `POST`   | `/api/auth/recover`                     | Regain an account with a code.            |
+| `POST`   | `/api/auth/account/delete`              | Delete your account.                      |
+| `GET`    | `/api/groups`                           | List your groups, members and invitees.   |
+| `GET`    | `/api/groups/mine`                      | List the groups you are a member of.      |
+| `POST`   | `/api/groups`                           | Create a group.                           |
+| `PUT`    | `/api/groups/{group}`                   | Rename or move a group.                   |
+| `DELETE` | `/api/groups/{group}`                   | Delete a group and its subgroups.         |
+| `POST`   | `/api/groups/{group}/invitations`       | Invite a user.                            |
+| `DELETE` | `/api/groups/{group}/members/{user}`    | Remove a member, or cancel an invitation. |
+| `DELETE` | `/api/groups/{group}/membership`        | Leave a group yourself.                   |
+| `GET`    | `/api/invitations`                      | List the invitations sent to you.         |
+| `POST`   | `/api/invitations/{invitation}/accept`  | Accept an invitation.                     |
+| `POST`   | `/api/invitations/{invitation}/decline` | Decline an invitation.                    |
+
+Nobody joins a group without consenting. An owner can only invite; the invited user sees
+who is asking, and becomes a member when they accept. Until then the group reaches them in
+no way: `groupIdsOf` counts memberships alone. Declining deletes the invitation, and leaving
+a group just ends the membership; either way, the owner may invite the user again.
+
+Changes to who is in or invited to a group lock that group's row first (`SELECT … FOR
+UPDATE`), so a double-clicked invite or two tabs accepting at once cannot duplicate a row.
+The lock is skipped on SQLite, which admits one writer at a time anyway.
+
+Inviting a username that does not exist is reported as such. That discloses whether an
+account exists, and is a deliberate trade so that someone inviting a list of names knows
+which they typed wrongly.
+
+## 🤝 Contributing
+
+Hecate is developed as part of a larger private project, of which this repository is an automatically synchronised
+mirror (by [GitHub Graph](https://github.com/SgtSwagrid/github-graph)), so changes made here directly would be overwritten.
+Issues are very welcome; for anything more, please open an issue first.
 
 ## 👁️ See also
 
+- [Eunomia](https://github.com/SgtSwagrid/Eunomia), its sibling, for filtering, ordering and paging lists.
 - This library was made using [Scala Library Template](https://github.com/SgtSwagrid/scala-library-template).

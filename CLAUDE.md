@@ -11,7 +11,49 @@ Keep it concise and actionable.
 
 ## Project overview
 
-This is a Scala library that does ...
+This is Hecate, a Scala 3 library for user accounts, sign-in sessions, nestable user groups and permissions,
+for full stack websites built on Tapir, Slick, Cats Effect and Laminar. It is in beta.
+
+- `core` (`com.alecdorrington.hecate`, JVM + JS) - the model (`User`, `Caller`, `Group`, `Principal`, `Access`,
+  `Grant`, `Resource`, `Permitted`, `Gated`, `AuthRefusal`), the wording of what the library says (`i18n/Wording`)
+  and the Tapir endpoint definitions (`api/AuthApi`).
+- `server` (`com.alecdorrington.hecate.server`) - password hashing, persistence and the endpoint implementations.
+  It opens no database but takes a `Transactor`; its tables are defined against a `JdbcProfile` passed to `AuthTables`
+  rather than a fixed one, so identifiers go through the `prefix` parameter, never string literals; and it deletes
+  nothing of the host's, taking instead a cascade hook run inside its own deletion transactions.
+  It creates its own tables (`AuthTables.createIfNotExists`) and has no migrations.
+- `client` (`com.alecdorrington.hecate.client`) - headless Laminar state (`AuthState`, `GroupsState`).
+
+The library never picks a language or writes a sentence of its own. A refusal is an `AuthRefusal` value;
+`Wording` (one member per phrase, so adding one fails every implementation until it is translated) turns one
+into a sentence, and the host passes `wording: Option[String] => Wording` to `AuthService`, `GroupService` and
+`AuthState`, defaulting to `Wording.english`. The language arrives as a `language` cookie
+(`AuthApi.languageCookie`) read by `AuthApi.secured` and by `register`/`login`/`recover`, so
+`AuthApi.Security` is `(session, language)` and `AuthService.require` answers a `Caller` (user plus locale).
+`AuthProblem` carries the refusal, and its `getMessage` is the English phrase, for logs and message-based tests.
+
+See [README.md](README.md) for how a host wires it up.
+
+### Where this code lives
+
+This repository is a mirror. The library is developed inside a larger private project, beneath `hecate/`, and every file
+here is copied from there by [GitHub Graph](https://github.com/SgtSwagrid/github-graph) whenever that project's `main`
+changes, overwriting whatever is here. So make changes there, never here. The shared configuration (workflows, Scalafmt, IDE settings, `project/plugins-*.sbt`
+other than `plugins-scalajs.sbt`) comes from further upstream still, in
+[Scala Library Config](https://github.com/SgtSwagrid/scala-library-config), which syncs into the private project's `hecate/` first.
+`build.sbt`, `release.sbt`, `project/Dependencies.scala`, `README.md` and this file belong to the library.
+
+### Build
+
+- `hecateCore` is a `projectMatrix` (JVM + JS; the JS row is `hecateCoreJS`), `hecateServer` is JVM, `hecateClient` is
+  Scala.js, and the root project `hecate` only aggregates them and is never published.
+- Project ids are prefixed with the library's name because the private project includes this build by reference
+  (`ProjectRef(file("hecate"), ...)`), and its own projects are called `server`, `client` and `common`.
+- The matrix pins `sourceDirectory` to `(ThisBuild / baseDirectory) / "core" / "src"`. Don't remove it: sbt 2.0.8
+  resolves a matrix's sources against the working directory, which is the host's when the build is included by reference,
+  and the library then compiles to an empty JAR without a single error of its own.
+- The library must never depend on anything in the project that includes it, and nothing here should assume a host, a database or a JDBC profile.
+- Versions come from git tags (`sbt-ci-release`); publishing a GitHub release publishes to Maven Central.
 
 ## Instructions
 
