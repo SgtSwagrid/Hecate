@@ -12,6 +12,12 @@ import slick.jdbc.JdbcCapabilities
   * The store of user groups, their memberships, and invitations to join them.
   * Groups are only ever visible to, and managed by, the user who created them.
   *
+  * No group may ever contain itself, however deeply: [[update]] refuses any
+  * move that would nest a group inside its own subtree, and [[create]] cannot
+  * form a cycle, as a new group has nothing inside it yet. Every walk of the
+  * tree here is guarded all the same, and never enters the same group twice, so
+  * that a cycle arriving by some other route could not spin forever.
+  *
   * Nobody joins a group without consenting. An owner can only invite; the
   * invited user becomes a member when they accept, and until then the group
   * reaches them in no way at all. Declining deletes the invitation, and the
@@ -61,37 +67,47 @@ final class GroupStore
     .contains(JdbcCapabilities.forUpdate)
 
   /**
-    * Lists every group owned by the given user, with its direct members and the
-    * users invited to it.
+    * The grants of the groups this store deletes, which go with them. Held here
+    * rather than built for each deletion, so that what this store depends on is
+    * named once and in one place.
     */
-  def list(owner: Long): IO[List[GroupView]] = db.run:
+  private val grants = GrantStore(tables, db)
+
+  /**
+    * Lists every group owned by the given user, with its direct members and the
+    * users invited to it. The groups they are merely a member of are
+    * [[memberships]], which is a different question.
+    */
+  def owned(owner: Long): IO[List[GroupView]] = db.run:
     for
       groups <- groupsOf(owner).sortBy(_.id).result
       ids = groups.map(_.id)
-      members <- tables
-        .members
-        .filter(_.groupId inSet ids)
-        .join(tables.users)
-        .on(_.userId === _.id)
-        .result
-      invitees <- tables
-        .invitations
-        .filter(_.groupId inSet ids)
-        .join(tables.users)
-        .on(_.userId === _.id)
-        .result
+      members <- ifAny(ids)(Seq.empty)(shown =>
+        tables
+          .members
+          .filter(_.groupId inSet shown)
+          .join(tables.users)
+          .on(_.userId === _.id)
+          .result,
+      )
+      invitees <- ifAny(ids)(Seq.empty)(shown =>
+        tables
+          .invitations
+          .filter(_.groupId inSet shown)
+          .join(tables.users)
+          .on(_.userId === _.id)
+          .result,
+      )
+      enrolled =
+        GroupStore.byGroup(members.map((row, user) => (row.groupId, user)))
+      invited =
+        GroupStore.byGroup(invitees.map((row, user) => (row.groupId, user)))
     yield groups
       .map(group =>
         GroupView(
           group.toGroup,
-          GroupStore.usersOf(
-            group.id,
-            members.map((row, user) => (row.groupId, user)),
-          ),
-          GroupStore.usersOf(
-            group.id,
-            invitees.map((row, user) => (row.groupId, user)),
-          ),
+          enrolled.getOrElse(group.id, List.empty),
+          invited.getOrElse(group.id, List.empty),
         ),
       )
       .toList
@@ -155,6 +171,11 @@ final class GroupStore
     * described on [[GroupStore]] should never leave a membership behind its
     * group, but this is what a host application acts on, so it does not rely on
     * that alone.
+    *
+    * Every permission check a host makes begins here, so it reads as little as
+    * it can: only the groups of the owners whose groups the user is in, since
+    * an ancestor is always a group of the same owner, and nothing at all for a
+    * user who is in no group.
     */
   def groupIdsOf(user: Long): IO[List[Long]] = db.run:
     for
@@ -163,16 +184,37 @@ final class GroupStore
         .filter(_.userId === user)
         .join(tables.groups)
         .on(_.groupId === _.id)
-        .map(_._1.groupId)
+        .map(row => (row._1.groupId, row._2.owner))
         .result
-      parents <- tables.groups.map(group => (group.id, group.parent)).result
-    yield GroupStore.withAncestors(direct, parents.toMap)
+      parents <- forest(direct.map(_._2))
+    yield GroupStore.withAncestors(direct.map(_._1), parents)
+
+  /**
+    * Every group of the given owners, as a map from each to its parent: the
+    * whole of the forest that any ancestor or descendant of theirs can lie in,
+    * since [[create]] and [[update]] let a group be nested only inside a group
+    * of the same owner. Never asks the database about no owners.
+    *
+    * A group whose parent is somebody else's, which no path through this store
+    * can produce, is simply where a walk stops: it confers less access rather
+    * than more.
+    */
+  private def forest(owners: Seq[Long]): DBIO[Map[Long, Option[Long]]] =
+    val distinct = owners.distinct
+    if distinct.isEmpty then DBIO.successful(Map.empty)
+    else
+      tables
+        .groups
+        .filter(_.owner inSet distinct)
+        .map(group => (group.id, group.parent))
+        .result
+        .map(_.toMap)
 
   /**
     * The identifiers of every user who is a member of any of the given groups,
     * or of any group nested inside one however deeply: everyone that anything
     * addressed to those groups reaches. The mirror of [[groupIdsOf]], which
-    * walks the tree upwards from a user, and tolerant of cycles in the same
+    * walks the tree upwards from a user, and guarded against cycles in the same
     * way. Never asks the database about no groups.
     */
   def membersWithin(groups: Seq[Long]): IO[List[Long]] =
@@ -181,9 +223,7 @@ final class GroupStore
       db.run:
         for
           parents <- tables.groups.map(group => (group.id, group.parent)).result
-          within = groups
-            .flatMap(GroupStore.withDescendants(_, parents))
-            .distinct
+          within = GroupStore.withDescendants(groups, parents)
           members <- tables
             .members
             .filter(_.groupId inSet within)
@@ -228,7 +268,10 @@ final class GroupStore
     */
   def update(owner: Long, id: Long, draft: GroupDraft): IO[Unit] = db.run((for
     _ <- lock(id +: draft.parent.toSeq)
-    _ <- ensure(owned(owner, id), GroupStore.missing)
+    _ <- ensure(
+      owns(owner, id),
+      AuthRefusal.GroupMissing,
+    )
     _ <- ensureParent(owner, draft.parent)
     _ <- ensureAcyclic(owner, id, draft.parent)
     _ <- tables
@@ -249,7 +292,7 @@ final class GroupStore
     groups <- locked(groupsOf(owner).sortBy(_.id)).result
     _      <-
       if groups.exists(_.id == id) then DBIO.successful(())
-      else DBIO.failed(AuthProblem(GroupStore.missing))
+      else DBIO.failed(AuthProblem(AuthRefusal.GroupMissing))
     _ <- deleteGroups(GroupStore.subtree(groups, id).toSeq)
   yield ()).transactionally)
 
@@ -264,8 +307,11 @@ final class GroupStore
     * needs to know which of them were typed wrongly.
     */
   def invite(owner: Long, group: Long, username: String): IO[User] = db.run((for
-    _     <- lock(Seq(group))
-    _     <- ensure(owned(owner, group), GroupStore.missing)
+    _ <- lock(Seq(group))
+    _ <- ensure(
+      owns(owner, group),
+      AuthRefusal.GroupMissing,
+    )
     found <- tables.users.filter(_.username === username).result.headOption
     user  <- required(
       found,
@@ -280,7 +326,7 @@ final class GroupStore
     */
   def accept(user: Long, invitation: Long): IO[Unit] = db.run((for
     found <- invitationOf(user, invitation).result.headOption
-    row   <- required(found, GroupStore.noInvitation)
+    row   <- required(found, AuthRefusal.InvitationMissing)
     _     <- lock(Seq(row.groupId))
     // Re-checked under the lock: the invitation may have been accepted,
     // declined, or its group deleted, while this waited. Deleting it, rather
@@ -288,7 +334,7 @@ final class GroupStore
     taken <- invitationOf(user, invitation).delete
     _     <-
       if taken == 1 then ensureMember(row.groupId, user)
-      else DBIO.failed(AuthProblem(GroupStore.noInvitation))
+      else DBIO.failed(AuthProblem(AuthRefusal.InvitationMissing))
   yield ()).transactionally)
 
   /**
@@ -301,7 +347,7 @@ final class GroupStore
       .delete
       .flatMap(removed =>
         if removed == 1 then DBIO.successful(())
-        else DBIO.failed(AuthProblem(GroupStore.noInvitation)),
+        else DBIO.failed(AuthProblem(AuthRefusal.InvitationMissing)),
       ),
   )
 
@@ -320,7 +366,10 @@ final class GroupStore
     */
   def withdraw(owner: Long, group: Long, user: Long): IO[Unit] = db.run((for
     _ <- lock(Seq(group))
-    _ <- ensure(owned(owner, group), GroupStore.missing)
+    _ <- ensure(
+      owns(owner, group),
+      AuthRefusal.GroupMissing,
+    )
     _ <- memberOf(group, user).delete
     _ <- invitationTo(group, user).delete
   yield ()).transactionally)
@@ -331,15 +380,14 @@ final class GroupStore
     * them. Composes into the caller's transaction.
     */
   private def deleteGroups(doomed: Seq[Long]): DBIO[Unit] =
-    val principals = doomed.map(Principal.Group(_))
-    if doomed.isEmpty then DBIO.successful(())
-    else
+    ifAny(doomed)(()): gone =>
+      val principals = gone.map(Principal.Group(_))
       for
-        _ <- tables.members.filter(_.groupId inSet doomed).delete
-        _ <- tables.invitations.filter(_.groupId inSet doomed).delete
-        _ <- GrantStore(tables, db).revokeHeldBy(principals)
+        _ <- tables.members.filter(_.groupId inSet gone).delete
+        _ <- tables.invitations.filter(_.groupId inSet gone).delete
+        _ <- grants.revokeHeldBy(principals)
         _ <- cascade(principals)
-        _ <- tables.groups.filter(_.id inSet doomed).delete
+        _ <- tables.groups.filter(_.id inSet gone).delete
       yield ()
 
   /**
@@ -400,7 +448,7 @@ final class GroupStore
             .exists
             .result,
         )
-      case Principal.Group(id) => db.run(owned(user, id))
+      case Principal.Group(id) => db.run(owns(user, id))
 
   /** The query for every group owned by the given user. */
   private def groupsOf(owner: Long) = tables.groups.filter(_.owner === owner)
@@ -432,15 +480,11 @@ final class GroupStore
     * order of identifier, so that changes to who is in or invited to them
     * happen one at a time. See [[GroupStore]].
     */
-  private def lock(groups: Seq[Long]): DBIO[Unit] =
-    if groups.isEmpty then DBIO.successful(())
-    else
-      locked(tables.groups.filter(_.id inSet groups).sortBy(_.id))
-        .result
-        .map(_ => ())
+  private def lock(groups: Seq[Long]): DBIO[Unit] = ifAny(groups)(()): held =>
+    locked(tables.groups.filter(_.id inSet held).sortBy(_.id)).result.unit
 
   /** Whether the given user owns a group with the given identifier. */
-  private def owned(owner: Long, id: Long): DBIO[Boolean] = groupsOf(owner)
+  private def owns(owner: Long, id: Long): DBIO[Boolean] = groupsOf(owner)
     .filter(_.id === id)
     .exists
     .result
@@ -464,7 +508,7 @@ final class GroupStore
     parent match
       case None     => DBIO.successful(())
       case Some(id) => ensure(
-          owned(owner, id),
+          owns(owner, id),
           AuthRefusal.ParentGroupMissing,
         )
 
@@ -496,7 +540,7 @@ final class GroupStore
     .zip(invitationTo(group, user).exists.result)
     .flatMap:
       case (false, false) =>
-        (tables.invitations += InvitationRow(0, group, user)).map(_ => ())
+        (tables.invitations += InvitationRow(0, group, user)).unit
       case _ => DBIO.successful(())
 
   /**
@@ -510,41 +554,37 @@ final class GroupStore
     .result
     .flatMap(present =>
       if present then DBIO.successful(())
-      else (tables.members += MemberRow(group, user)).map(_ => ()),
+      else (tables.members += MemberRow(group, user)).unit,
     )
 
 object GroupStore:
 
   /**
-    * The refusal for a group that does not exist, or is not the user's. One
-    * refusal for both, so that neither can be told from the other.
+    * The users linked to each group, sorted by username, given the links of
+    * every group at once: grouped here once, rather than the whole list being
+    * searched through again for every group.
     */
-  private val missing = AuthRefusal.GroupMissing
-
-  /**
-    * The refusal for an invitation that does not exist, or was sent to somebody
-    * else. One refusal for both, as for [[missing]].
-    */
-  private val noInvitation = AuthRefusal.InvitationMissing
-
-  /** The users linked to one group, sorted by username. */
-  private def usersOf(group: Long, links: Seq[(Long, UserRow)]): List[User] =
+  private def byGroup(links: Seq[(Long, UserRow)]): Map[Long, List[User]] =
     links
-      .collect { case (id, user) if id == group => user.toUser }
-      .sortBy(_.username)
-      .toList
+      .groupMap(_._1)(_._2.toUser)
+      .view
+      .mapValues(_.sortBy(_.username).toList)
+      .toMap
 
   /**
     * The identifiers of the given group and every group nested beneath it,
     * within one owner's forest of groups.
     */
   private def subtree(groups: Seq[GroupRow], root: Long): Set[Long] = GroupStore
-    .withDescendants(root, groups.map(g => (g.id, g.parent)))
+    .withDescendants(
+      Seq(root),
+      groups.map(g => (g.id, g.parent)),
+    )
     .toSet
 
   /**
     * The given group identifiers together with every ancestor of theirs,
-    * walking `parents` and tolerating any cycle it may contain.
+    * walking `parents` and never climbing into the same group twice.
     */
   private def withAncestors
     (
@@ -558,12 +598,14 @@ object GroupStore:
     direct.foldLeft(Set.empty[Long])((acc, id) => climb(id, acc)).toList.sorted
 
   /**
-    * One group together with every group nested inside it, given every group's
-    * parent, tolerating cycles.
+    * The given groups together with every group nested inside them, given every
+    * group's parent. The index from a group to its children is built once,
+    * however many groups are walked, and no group is descended into twice, so a
+    * cycle could not spin forever.
     */
   private def withDescendants
     (
-      root: Long,
+      roots: Seq[Long],
       parents: Seq[(Long, Option[Long])],
     )
     : List[Long] =
@@ -574,4 +616,7 @@ object GroupStore:
         children
           .getOrElse(Some(id), Nil)
           .foldLeft(seen + id)((acc, child) => descend(child, acc))
-    descend(root, Set.empty).toList.sorted
+    roots
+      .foldLeft(Set.empty[Long])((acc, root) => descend(root, acc))
+      .toList
+      .sorted

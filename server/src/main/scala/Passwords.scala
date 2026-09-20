@@ -18,11 +18,25 @@ import javax.crypto.spec.PBEKeySpec
   */
 object Passwords:
 
-  /** The PBKDF2 iteration count applied to newly hashed passwords. */
-  private val iterations = 120000
+  /**
+    * The PBKDF2 iteration count applied to newly hashed passwords where a host
+    * application names none, following OWASP's guidance for PBKDF2-HMAC-SHA256.
+    * Every hash stores the count it was derived under, so this may be raised
+    * whenever the guidance moves without stranding a single stored password.
+    */
+  val iterations = 600000
 
   /** The size of the derived hash, in bits. */
   private val keyBits = 256
+
+  /**
+    * The most iterations a stored hash may ask for. A hash is a number this
+    * process obeys, so a row naming millions of rounds would pin a thread for
+    * minutes on end; one naming none at all would fail outright. Only a count
+    * between one and this is derived, and any other never matches, exactly as
+    * any other malformed hash never matches.
+    */
+  private val maxRounds = 10000000
 
   /** The size of the random salt, in bytes. */
   private val saltBytes = 16
@@ -41,12 +55,23 @@ object Passwords:
   val decoy: String = s"$iterations:${ encode(randomBytes(saltBytes)) }:" +
     encode(randomBytes(keyBits / 8))
 
-  /** Hashes a password under a fresh random salt. */
-  def hash(password: String): IO[String] = IO.blocking:
-    val salt = randomBytes(saltBytes)
-    s"$iterations:${ encode(salt) }:${ encode(
-        derive(password, salt, iterations),
-      ) }"
+  /**
+    * Hashes a password under a fresh random salt.
+    *
+    * @param password
+    *   The password to hash.
+    *
+    * @param rounds
+    *   How many iterations to derive it under. Higher costs an attacker more,
+    *   and costs this server the same, on every sign-in.
+    *
+    * @return
+    *   A hash in the stored form, of the given password under a fresh salt.
+    */
+  def hash(password: String, rounds: Int = iterations): IO[String] = IO
+    .blocking:
+      val salt = randomBytes(saltBytes)
+      s"$rounds:${ encode(salt) }:${ encode(derive(password, salt, rounds)) }"
 
   /**
     * Whether the password matches a stored hash. Hashes are compared in
@@ -56,13 +81,34 @@ object Passwords:
     stored.split(':') match
       case Array(rounds, salt, hash) =>
         (rounds.toIntOption, decode(salt), decode(hash)) match
-          case (Some(count), Some(saltBytes), Some(hashBytes)) => MessageDigest
-              .isEqual(
-                derive(password, saltBytes, count),
-                hashBytes,
-              )
+          case (Some(count), Some(saltBytes), Some(hashBytes))
+            if count > 0 && count <= maxRounds =>
+            MessageDigest.isEqual(
+              derive(password, saltBytes, count),
+              hashBytes,
+            )
           case _ => false
       case _ => false
+
+  /**
+    * Whether a stored hash was derived under fewer rounds than are applied now,
+    * and so is worth deriving again the next time the password is known.
+    *
+    * @param stored
+    *   The stored hash.
+    *
+    * @param rounds
+    *   The iteration count a password would be hashed under today.
+    *
+    * @return
+    *   Whether the stored hash is weaker than a fresh one would be. A hash too
+    *   malformed to say is left alone: [[verify]] refuses it anyway.
+    */
+  def outdated(stored: String, rounds: Int = iterations): Boolean = stored
+    .split(':')
+    .headOption
+    .flatMap(_.toIntOption)
+    .exists(_ < rounds)
 
   /** Derives a hash from a password and salt using PBKDF2. */
   private def derive

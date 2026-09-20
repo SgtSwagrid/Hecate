@@ -66,6 +66,12 @@ val endpoints = auth.api ++ groups.api ++ myOwnEndpoints
 
 `AuthTables` is parameterised on the Slick profile, so the library is not bound to any
 one database. Pass `prefix` if its tables need to sit in a namespace of their own.
+That prefix becomes part of the table names, so it must be a constant of your own choosing
+rather than anything a request carries.
+
+The stores expect `READ COMMITTED` or stricter, and use `SELECT … FOR UPDATE` where the
+profile has it, to serialise the changes that no table constraint can (see *Groups* below).
+On SQLite, which has neither, one writer at a time makes the locks unnecessary.
 
 ### Securing your own endpoints
 
@@ -83,16 +89,33 @@ myEndpoint
   .serverLogic(caller => _ => thingsOwnedBy(caller.id))
 ```
 
+Nothing here throttles anything. Sign-in costs a PBKDF2 derivation whether the password is
+right or wrong, which bounds how fast an attacker can guess, but a library that opens no
+socket cannot rate-limit by address: put that in front of these endpoints yourself. Recovery
+codes are the one exception, and deliberately so — each is about 49 bits of entropy, which
+no amount of guessing gets through.
+
 Sessions live in an HTTP-only, `SameSite=Strict` cookie, and expire in the store as well
-as in the browser, so a leaked token cannot outlive its expiry. Passwords are stored as
+as in the browser, so a leaked token cannot outlive its expiry. Nothing clears out
+the rows of sessions that have expired, since an expired session is refused whether or
+not its row is still there; schedule `UserStore.purgeExpired` if you would rather the
+table did not keep them. Passwords are stored as
 salted PBKDF2 hashes, compared in constant time; an unknown username is checked against a
 decoy hash so that sign-in takes the same time whether or not the account exists.
+
+Usernames are trimmed of surrounding space and then matched exactly: `Alice` and `alice`
+are two accounts. If you want them to be one, fold the case yourself before registering
+and before signing in.
 
 Tune the session lifetime and the password rules with `AuthPolicy`:
 
 ```scala
 AuthService(users, AuthPolicy(sessionSeconds = 3600, minPasswordLength = 12))
 ```
+
+Passwords are derived with PBKDF2-HMAC-SHA256 at `AuthPolicy.hashingRounds` iterations,
+which defaults to OWASP's current figure. Each stored hash carries the count it was
+derived under, so raising it later leaves every stored password verifiable.
 
 ### Speaking the user's language
 
@@ -127,10 +150,19 @@ Deleting a group deletes every group beneath it. To delete whatever your applica
 attaches to a group in the same transaction, pass a cascade:
 
 ```scala
-GroupStore(tables, db, ids => myTable.filter(_.groupId inSet ids).delete.map(_ => ()))
+GroupStore(
+  tables,
+  db,
+  principals =>
+    val groups = principals.collect { case Principal.Group(id) => id }
+    myTable.filter(_.groupId inSet groups).delete.map(_ => ()),
+)
 ```
 
-The cascade runs before the groups themselves are removed, so it may still join on them.
+The cascade is handed `Principal`s rather than bare identifiers, because the same hook
+serves account deletion, where the principal is the user themselves; a user and a group
+may share an identifier, so match on the kind you mean. It runs before the groups
+themselves are removed, so it may still join on them.
 
 ### Accounts
 
@@ -152,7 +184,10 @@ user in one transaction: their sessions and recovery codes, the groups they own 
 those groups' members, invitations and grants), their memberships and invitations
 elsewhere, the grants they hold, and whatever the host application attaches to them.
 It is refused while the user, with the groups they own, is the only owner of some resource,
-which would otherwise be left owned by nobody; they must first pass it on or delete it.
+which would otherwise be left owned by nobody; they must first pass it on or delete it. Another
+owner means another principal holding `Own`: a group counts, even one with no members
+left in it, so this guarantees that something still owns the resource rather than that
+somebody can still open it.
 It is off unless the host application passes an `AccountStore`:
 
 ```scala
@@ -227,7 +262,8 @@ div(child <-- auth.user.map {
 `AuthState.user` changes on startup, sign-in and sign-out, so other state can follow it to
 refetch whatever belongs to the user. Until `AuthState.ready` is `true` nothing is known
 yet, and a `None` user must not be read as "signed out". `GroupsState.forest` nests the
-server's flat group list for rendering.
+server's flat group list for rendering. Both states take a `Wording` for the few things they
+say themselves; everything the server refuses arrives already worded.
 
 ## API
 

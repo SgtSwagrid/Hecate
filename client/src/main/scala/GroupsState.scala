@@ -1,6 +1,7 @@
 package com.alecdorrington.hecate
 package client
 
+import com.alecdorrington.hecate.i18n.Wording
 import com.alecdorrington.hecate.model.{
   Group, GroupDraft, GroupView, Invitation, Invite, User,
 }
@@ -23,52 +24,76 @@ import scala.concurrent.ExecutionContext.Implicits.global
   *
   * @param auth
   *   The sign-in state whose user these groups belong to.
+  *
+  * @param wording
+  *   What this state says itself, in the language the host shows. The server's
+  *   refusals arrive already worded, in the language of the `language` cookie
+  *   the host sets.
   */
-final class GroupsState(auth: AuthState):
+final class GroupsState
+  (
+    auth: AuthState,
+    wording: Wording = Wording.english,
+  ):
 
-  private val stored: Var[List[GroupView]] = Var(List.empty)
+  /**
+    * Everything here is bound to the page rather than to a view, since this
+    * state outlives any one view and every request it makes must arrive whether
+    * or not something is on screen to receive it.
+    */
+  private given Owner = unsafeWindowOwner
 
-  private val joined: Var[List[Group]] = Var(List.empty)
+  private val groupsVar: Var[List[GroupView]] = Var(List.empty)
 
-  private val invited: Var[List[Invitation]] = Var(List.empty)
+  private val joinedVar: Var[List[Group]] = Var(List.empty)
 
-  private val failure: Var[Option[String]] = Var(None)
+  private val invitationsVar: Var[List[Invitation]] = Var(List.empty)
+
+  private val errorVar: Var[Option[String]] = Var(None)
+
+  private val pendingVar: Var[Boolean] = Var(false)
 
   /**
     * Every group owned by the signed-in user, with its direct members and
     * invitees.
     */
-  val groups: Signal[List[GroupView]] = stored.signal
+  val groups: Signal[List[GroupView]] = groupsVar.signal
 
   /**
     * The signed-in user's groups, nested by [[Group.parent]], with siblings
     * ordered by name.
     */
-  val forest: Signal[List[GroupTree]] = stored.signal.map(GroupsState.nest)
+  val forest: Signal[List[GroupTree]] = groupsVar.signal.map(GroupsState.nest)
 
   /**
     * The groups the signed-in user is a member of but does not own. Their own
     * groups are not repeated here.
     */
-  val memberships: Signal[List[Group]] = joined
+  val memberships: Signal[List[Group]] = joinedVar
     .signal
-    .combineWith(stored.signal)
+    .combineWith(groupsVar.signal)
     .mapN((mine, owned) =>
       mine.filterNot(group => owned.exists(_.group.id == group.id)),
     )
 
   /** The pending invitations sent to the signed-in user. */
-  val invitations: Signal[List[Invitation]] = invited.signal
+  val invitations: Signal[List[Invitation]] = invitationsVar.signal
 
   /** The reason the last command was refused, if any. */
-  val error: Signal[Option[String]] = failure.signal
+  val error: Signal[Option[String]] = errorVar.signal
+
+  /**
+    * Whether a command is in flight, for a view that disables its buttons while
+    * one is. Only commands count: the refetching that follows one, and the
+    * refetching a sign-in sets off, are nobody's to wait for.
+    */
+  val pending: Signal[Boolean] = pendingVar.signal
 
   // The lists belong to whoever is signed in, so they follow them: fetched for
   // each user as they sign in, including one signed in already when this state
   // is built (a signal, not its changes, so that a fresh page load with a live
   // session still loads them), and emptied when they sign out.
   locally:
-    given Owner = unsafeWindowOwner
     auth
       .user
       .map(_.map(_.id))
@@ -77,15 +102,15 @@ final class GroupsState(auth: AuthState):
 
   /** Empties every list, as nobody is signed in to own them. */
   private def clear(): Unit =
-    stored.set(List.empty)
-    joined.set(List.empty)
-    invited.set(List.empty)
+    groupsVar.set(List.empty)
+    joinedVar.set(List.empty)
+    invitationsVar.set(List.empty)
 
   /** Refetches every list, emptying those whose requests are refused. */
   def refresh(): Unit =
-    fetch[GroupView]("/api/groups", stored)
-    fetch[Group]("/api/groups/mine", joined)
-    fetch[Invitation]("/api/invitations", invited)
+    fetch[GroupView]("/api/groups", groupsVar)
+    fetch[Group]("/api/groups/mine", joinedVar)
+    fetch[Invitation]("/api/invitations", invitationsVar)
 
   /** Creates a group, nested under the given parent when there is one. */
   def create(name: String, parent: Option[Long] = None): Unit = command(
@@ -161,20 +186,16 @@ final class GroupsState(auth: AuthState):
     command(Fetch.delete(s"/api/groups/$group/membership").text)
 
   /** Discards the last error, so that a corrected form starts clean. */
-  def clearError(): Unit = failure.set(None)
+  def clearError(): Unit = errorVar.set(None)
 
   /** Replaces one list with what an endpoint returns, or with nothing. */
   private def fetch[X : Decoder](url: String, into: Var[List[X]]): Unit =
-    given Owner = unsafeWindowOwner
-    Fetch
-      .get(url)
-      .text
-      .map(response =>
-        if response.status >= 400 then List.empty
-        else decode[List[X]](response.data).getOrElse(List.empty),
-      )
-      .recover { case _ => Some(List.empty) }
-      .foreach(into.set)
+    Replied
+      .of(Fetch.get(url).text)
+      .foreach:
+        case Replied.Answered(response) =>
+          into.set(decode[List[X]](response.data).getOrElse(List.empty))
+        case _ => into.set(List.empty)
 
   /**
     * Runs one command, recording any refusal and refetching the lists.
@@ -189,17 +210,21 @@ final class GroupsState(auth: AuthState):
       refused: String => Unit = _ => (),
     )
     : Unit =
-    given Owner = unsafeWindowOwner
-    failure.set(None)
-    // Each outcome carries its problem, if any, and whether the server answered.
-    request
-      .map(response =>
-        (Option.when(response.status >= 400)(response.data), true),
-      )
-      .recover { case error => Some((Some(error.getMessage), false)) }
-      .foreach: (problem, answered) =>
-        failure.set(problem)
-        if answered then problem.foreach(refused)
+    pendingVar.set(true)
+    errorVar.set(None)
+    Replied
+      .of(request)
+      .foreach: outcome =>
+        pendingVar.set(false)
+        outcome match
+          case Replied.Answered(_)      => errorVar.set(None)
+          case Replied.Refused(problem) =>
+            errorVar.set(Some(problem))
+            refused(problem)
+          // Nothing was refused, so nothing is reported to the one caller
+          // waiting on a refusal of its own; the reason a request never
+          // arrived is this state's own to word.
+          case Replied.Unreachable(_) => errorVar.set(Some(wording.unreachable))
         refresh()
 
 object GroupsState:
@@ -207,28 +232,60 @@ object GroupsState:
   /**
     * Rebuilds the nesting of a flat group list, deepest branches included, with
     * siblings ordered by name.
+    *
+    * No group may contain itself, however deeply: the server refuses any move
+    * that would nest one inside its own subtree, so a cycle can never be
+    * stored. Nothing here relies on that alone, as a group lost to a cycle
+    * would be a group its owner could no longer reach.
+    *
+    * Visible to the tests, which is the only way to reach it without a server
+    * to fetch a list from.
     */
-  private def nest(groups: List[GroupView]): List[GroupTree] =
-    val children                         = groups.groupBy(_.group.parent)
-    val known                            = groups.map(_.group.id).toSet
-    def grow(view: GroupView): GroupTree = GroupTree(
-      view,
-      children
-        .getOrElse(Some(view.group.id), List.empty)
-        .sortBy(_.group.name)
-        .map(grow),
-    )
+  private[client] def nest(groups: List[GroupView]): List[GroupTree] =
+    val ordered = groups.sortBy(_.group.name)
+    val known   = ordered.map(_.group.id).toSet
     // A group whose parent is missing is shown at the top level rather than
-    // being hidden, so that no group can be lost.
-    groups
-      .filterNot(_.group.parent.exists(known))
-      .sortBy(_.group.name)
-      .map(grow)
+    // being hidden, and so, after those, is any group a cycle would otherwise
+    // bury, so that no group can be lost.
+    plant(
+      ordered.groupBy(_.group.parent),
+    )(ordered.filterNot(_.group.parent.exists(known)) ++ ordered)
+
+  /**
+    * Grows a tree from each of the given groups in turn, skipping any that a
+    * tree already grown shows, so that every group appears exactly once.
+    */
+  private def plant
+    (children: Map[Option[Long], List[GroupView]])
+    (roots: List[GroupView])
+    : List[GroupTree] = roots
+    .foldLeft((List.empty[GroupTree], Set.empty[Long])):
+      case ((forest, shown), view) if shown(view.group.id) => (forest, shown)
+      case ((forest, shown), view)                         =>
+        val tree = grow(children)(view, Set.empty)
+        (tree :: forest, shown ++ tree.flatten.map(_.view.group.id))
+    ._1
+    .reverse
+
+  /**
+    * One group together with every group nested inside it, never descending
+    * twice into the same group, so that a cycle could not spin forever.
+    */
+  private def grow
+    (children: Map[Option[Long], List[GroupView]])
+    (view: GroupView, enclosing: Set[Long])
+    : GroupTree = GroupTree(
+    view,
+    children
+      .getOrElse(Some(view.group.id), List.empty)
+      .filterNot(child => enclosing(child.group.id))
+      .map(grow(children)(_, enclosing + view.group.id)),
+  )
 
 /**
   * One group in the nested view, with the groups inside it.
   *
-  * @param group
+  * @param view
   *   The group, its direct members and its invitees.
   *
   * @param children
@@ -236,7 +293,7 @@ object GroupsState:
   */
 final case class GroupTree
   (
-    group: GroupView,
+    view: GroupView,
     children: List[GroupTree],
   ):
 
@@ -251,7 +308,7 @@ final case class GroupTree
     * @param depth
     *   The depth of this group, from `0` at the top level.
     */
-  def ranked(depth: Int = 0): List[(GroupView, Int)] = (group, depth) ::
+  def ranked(depth: Int = 0): List[(GroupView, Int)] = (view, depth) ::
     children.flatMap(_.ranked(depth + 1))
 
   /**
@@ -260,6 +317,6 @@ final case class GroupTree
     * never counted here.
     */
   def members: List[User] = flatten
-    .flatMap(_.group.members)
+    .flatMap(_.view.members)
     .distinctBy(_.id)
     .sortBy(_.username)

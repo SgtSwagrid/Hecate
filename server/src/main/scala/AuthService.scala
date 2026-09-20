@@ -2,6 +2,7 @@ package com.alecdorrington.hecate
 package server
 
 import cats.effect.IO
+import cats.effect.std.Console
 import cats.syntax.all.*
 import com.alecdorrington.hecate.api.AuthApi
 import com.alecdorrington.hecate.i18n.Wording
@@ -25,6 +26,8 @@ import sttp.tapir.server.ServerEndpoint
   * Every refusal is worded for its reader: the language cookie each request
   * carries is handed to [[wording]], and the [[Wording]] that comes back writes
   * the sentence. The library itself decides only *why* a request is refused.
+  * Any other failure is handed to [[report]] and answered with the wording's
+  * fixed phrase, so that no driver or SQL detail escapes to a client.
   *
   * @param users
   *   The store the users, sessions and recovery codes are kept in.
@@ -38,6 +41,11 @@ import sttp.tapir.server.ServerEndpoint
   *   everything of its that belongs to a user; until then the endpoint is not
   *   served at all, and [[AuthRules.accountDeletion]] tells clients so.
   *
+  * @param report
+  *   Records a failure whose detail must not reach the client. Defaults to the
+  *   console, so that no failure goes unrecorded; a host application with its
+  *   own logging should pass its logger instead.
+  *
   * @param wording
   *   The wording refusals are written in, chosen by the language a request asks
   *   for, or `None` when it asks for none. Defaults to the library's English
@@ -48,28 +56,41 @@ final class AuthService
     users: UserStore,
     policy: AuthPolicy = AuthPolicy(),
     accounts: Option[AccountStore] = None,
+    report: Throwable => IO[Unit] = error => Console[IO].printStackTrace(error),
     wording: Option[String] => Wording = _ => Wording.english,
   ):
+
+  private val failures = Failures(wording, report)
 
   /** An endpoint that registers a new account and signs it in. */
   lazy val register: ServerEndpoint[Any, IO] = AuthApi
     .register
-    .serverLogic(signUp)
+    .serverLogic((credentials, locale) =>
+      failures.caught(locale)(signUp(credentials, locale)),
+    )
 
   /** An endpoint that signs into an existing account. */
-  lazy val login: ServerEndpoint[Any, IO] = AuthApi.login.serverLogic(signIn)
+  lazy val login: ServerEndpoint[Any, IO] = AuthApi
+    .login
+    .serverLogic((credentials, locale) =>
+      failures.caught(locale)(signIn(credentials, locale)),
+    )
 
   /** An endpoint that signs the current user out. */
-  lazy val logout: ServerEndpoint[Any, IO] = AuthApi.logout.serverLogic(signOut)
+  lazy val logout: ServerEndpoint[Any, IO] = AuthApi
+    .logout
+    .serverLogic(token => failures.caught(None)(signOut(token)))
 
   /** An endpoint that identifies the signed-in user, if any. */
-  lazy val me: ServerEndpoint[Any, IO] = AuthApi.me.serverLogic(current)
+  lazy val me: ServerEndpoint[Any, IO] = AuthApi
+    .me
+    .serverLogic(token => failures.attempt(None)(current(token)))
 
   /** An endpoint that describes the rules for accounts. */
   lazy val rules: ServerEndpoint[Any, IO] = AuthApi
     .rules
     .serverLogic(_ =>
-      IO.pure(Right(AuthRules(
+      failures.attempt(None)(IO.pure(AuthRules(
         policy.minPasswordLength,
         accounts.isDefined,
       ))),
@@ -79,14 +100,19 @@ final class AuthService
   lazy val changePassword: ServerEndpoint[Any, IO] = AuthApi
     .changePassword
     .serverSecurityLogic(require)
-    .serverLogic(caller => change => changePasswordOf(caller, change))
+    .serverLogic(caller =>
+      change => failures.caught(caller.locale)(changePasswordOf(caller, change)),
+    )
 
   /** An endpoint that issues the signed-in user a fresh set of recovery codes. */
   lazy val recoveryCodes: ServerEndpoint[Any, IO] = AuthApi
     .recoveryCodes
     .serverSecurityLogic(require)
     .serverLogic(caller =>
-      check => confirmed(caller, check.password)(issueCodes(caller.user)),
+      check =>
+        failures.caught(caller.locale)(
+          confirmed(caller, check.password)(issueCodes(caller.user)),
+        ),
     )
 
   /** An endpoint that counts the signed-in user's unused recovery codes. */
@@ -94,13 +120,15 @@ final class AuthService
     .recoveryCodesLeft
     .serverSecurityLogic(require)
     .serverLogic(caller =>
-      _ => users.recoveryCodesLeft(caller.id).map(Right(_)),
+      _ => failures.attempt(caller.locale)(users.recoveryCodesLeft(caller.id)),
     )
 
   /** An endpoint that regains an account with a recovery code. */
   lazy val recover: ServerEndpoint[Any, IO] = AuthApi
     .recover
-    .serverLogic(recoverAccount)
+    .serverLogic((recovery, locale) =>
+      failures.caught(locale)(recoverAccount(recovery, locale)),
+    )
 
   /**
     * An endpoint that deletes the signed-in user's account. A deletion the
@@ -112,17 +140,7 @@ final class AuthService
     .serverSecurityLogic(require)
     .serverLogic(caller =>
       check =>
-        accounts match
-          case None        => IO.pure(Left(words(caller).noAccountDeletion))
-          case Some(store) => confirmed(caller, check.password)(
-              store
-                .delete(caller.id)
-                .attemptNarrow[AuthProblem]
-                .map(_.bimap(
-                  problem => words(caller).phrase(problem.refusal),
-                  _ => AuthService.cookie("", 0),
-                )),
-            ).map(_.flatten),
+        failures.caught(caller.locale)(removeAccount(caller, check.password)),
     )
 
   /** Every endpoint implemented by this service. */
@@ -145,22 +163,29 @@ final class AuthService
     */
   def require(security: AuthApi.Security): IO[Either[String, Caller]] =
     val (token, locale) = security
-    token
-      .flatTraverse(users.sessionUser)
-      .map(_.map(Caller(_, locale)).toRight(wording(locale).signedOut))
+    failures.caught(locale)(
+      token
+        .flatTraverse(users.sessionUser)
+        .map(_.map(Caller(_, locale)).toRight(wording(locale).signedOut)),
+    )
 
   /** The wording one caller's refusals are written in. */
   private def words(caller: Caller): Wording = wording(caller.locale)
 
   /** Registers a new account, then opens a session for it. */
   private def signUp
-    (request: (Credentials, Option[String]))
+    (
+      credentials: Credentials,
+      locale: Option[String],
+    )
     : IO[Either[String, (User, CookieValueWithMeta)]] =
-    val (credentials, locale) = request
     policy.reject(credentials) match
       case Some(problem) => IO.pure(Left(wording(locale).phrase(problem)))
       case None          => Passwords
-          .hash(credentials.password)
+          .hash(
+            credentials.password,
+            policy.hashingRounds,
+          )
           .flatMap(users.register(credentials.username.trim, _))
           .flatMap:
             case None       => IO.pure(Left(wording(locale).usernameTaken))
@@ -172,14 +197,15 @@ final class AuthService
     * takes as long either way and cannot be used to enumerate accounts.
     */
   private def signIn
-    (request: (Credentials, Option[String]))
-    : IO[Either[String, (User, CookieValueWithMeta)]] =
-    val (credentials, locale) = request
-    users
-      .findByUsername(credentials.username.trim)
-      .flatMap(verified(_, credentials.password))
-      .flatMap(_.traverse(row => openSession(row.toUser)))
-      .map(_.toRight(wording(locale).incorrectCredentials))
+    (
+      credentials: Credentials,
+      locale: Option[String],
+    )
+    : IO[Either[String, (User, CookieValueWithMeta)]] = users
+    .findByUsername(credentials.username.trim)
+    .flatMap(verified(_, credentials.password))
+    .flatMap(_.traverse(row => openSession(row.toUser)))
+    .map(_.toRight(wording(locale).incorrectCredentials))
 
   /** Closes any session under the given token, and expires the cookie. */
   private def signOut
@@ -189,8 +215,8 @@ final class AuthService
     .as(Right(AuthService.cookie("", 0)))
 
   /** The signed-in user under the given token, if any. */
-  private def current(token: Option[String]): IO[Either[String, Option[User]]] =
-    token.flatTraverse(users.sessionUser).map(Right(_))
+  private def current(token: Option[String]): IO[Option[User]] = token
+    .flatTraverse(users.sessionUser)
 
   /**
     * Changes a user's password once their current one is confirmed. Every
@@ -204,11 +230,26 @@ final class AuthService
       case Some(problem) => IO.pure(Left(words(caller).phrase(problem)))
       case None          => confirmed(caller, change.current):
           for
-            hash    <- Passwords.hash(change.replacement)
+            hash <- Passwords.hash(
+              change.replacement,
+              policy.hashingRounds,
+            )
             token   <- AuthService.freshToken
             expires <- expiry
             _       <- users.resetPassword(caller.id, hash, token, expires)
           yield AuthService.cookie(token, policy.sessionSeconds)
+
+  /**
+    * Deletes the caller's account once their password is confirmed, and expires
+    * the cookie. Refused outright where the host application offers no account
+    * deletion at all.
+    */
+  private def removeAccount
+    (caller: Caller, password: String)
+    : IO[Either[String, CookieValueWithMeta]] = accounts match
+    case None        => IO.pure(Left(words(caller).noAccountDeletion))
+    case Some(store) => confirmed(caller, password):
+        store.delete(caller.id).as(AuthService.cookie("", 0))
 
   /** Generates a fresh set of recovery codes, storing only their hashes. */
   private def issueCodes(user: User): IO[RecoveryCodes] = RecoveryCode
@@ -224,14 +265,19 @@ final class AuthService
     * up, so that the reply takes as long whether or not the account exists.
     */
   private def recoverAccount
-    (request: (Recovery, Option[String]))
+    (
+      recovery: Recovery,
+      locale: Option[String],
+    )
     : IO[Either[String, (User, CookieValueWithMeta)]] =
-    val (recovery, locale) = request
     policy.rejectPassword(recovery.replacement) match
       case Some(problem) => IO.pure(Left(wording(locale).phrase(problem)))
       case None          =>
         for
-          hash    <- Passwords.hash(recovery.replacement)
+          hash <- Passwords.hash(
+            recovery.replacement,
+            policy.hashingRounds,
+          )
           token   <- AuthService.freshToken
           expires <- expiry
           found   <- users.recover(
@@ -272,6 +318,17 @@ final class AuthService
       found.fold(Passwords.decoy)(_.passwordHash),
     )
     .map(matches => found.filter(_ => matches))
+    .flatTap(_.traverse_(rehashed(_, password)))
+
+  /**
+    * Stores a password again, under the iteration count applied now, where it
+    * was stored under fewer. A cost raised in a later version then reaches the
+    * accounts that never change their password, on the one occasion their
+    * password is known: the moment they prove it.
+    */
+  private def rehashed(row: UserRow, password: String): IO[Unit] =
+    IO.whenA(Passwords.outdated(row.passwordHash)):
+      Passwords.hash(password).flatMap(users.rehash(row.id, _))
 
   /** Opens a fresh session for the given user, yielding its cookie. */
   private def openSession(user: User): IO[(User, CookieValueWithMeta)] =
@@ -279,7 +336,6 @@ final class AuthService
       token   <- AuthService.freshToken
       expires <- expiry
       _       <- users.openSession(token, user.id, expires)
-      _       <- users.purgeExpired
     yield (user, AuthService.cookie(token, policy.sessionSeconds))
 
   /** When a session opened now expires, in epoch milliseconds. */
@@ -320,11 +376,18 @@ object AuthService:
   *
   * @param minPasswordLength
   *   The fewest characters a password may have.
+  *
+  * @param hashingRounds
+  *   How many PBKDF2 iterations a newly hashed password is derived under.
+  *   Defaults to [[Passwords.iterations]]. Raise it on hardware that can afford
+  *   it, and never lower it below what a password already stored was hashed
+  *   under, which each hash carries with it.
   */
 final case class AuthPolicy
   (
     sessionSeconds: Long = 30L * 24 * 60 * 60,
     minPasswordLength: Int = 8,
+    hashingRounds: Int = Passwords.iterations,
   ):
 
   /** How long a session lasts, in milliseconds. */

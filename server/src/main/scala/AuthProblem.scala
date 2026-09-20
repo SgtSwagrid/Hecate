@@ -10,12 +10,11 @@ import com.alecdorrington.hecate.model.AuthRefusal
   * own language, whereas any other failure is reported generically, so that no
   * driver or SQL detail escapes to the client.
   *
+  * Its message is the refusal in English, for logs and for tests that match on
+  * one; a client is shown it worded in its own language instead.
+  *
   * @param refusal
   *   Why the request was refused.
   */
-final case class AuthProblem
-  (refusal: AuthRefusal)
-  extends Exception(Wording.english.phrase(refusal)):
-
-  /** The refusal in English, for logs and tests; clients read it worded. */
-  def message: String = getMessage
+final case class AuthProblem(refusal: AuthRefusal)
+  extends Exception(Wording.english.phrase(refusal))

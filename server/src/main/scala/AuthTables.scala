@@ -5,6 +5,7 @@ import com.alecdorrington.hecate.model.{
   Access, Grant, Group, Principal, Resource, User,
 }
 import slick.jdbc.JdbcProfile
+import slick.jdbc.meta.MTable
 
 /**
   * The tables this library stores its users, sessions and groups in, defined
@@ -12,17 +13,20 @@ import slick.jdbc.JdbcProfile
   * one. Create an instance with the application's own profile and share it
   * between the stores.
   *
-  * No table declares a composite primary key or a foreign key: Slick emits both
-  * as separate `ALTER TABLE` statements that no `CREATE TABLE IF NOT EXISTS`
-  * guards, so a second startup would replay and fail on them. Where a composite
-  * key would otherwise apply, the stores maintain uniqueness themselves.
+  * No table declares a composite primary key or a foreign key. Where a
+  * composite key would otherwise apply, the stores maintain uniqueness
+  * themselves, under the row locks described on [[GroupStore]]. A table's
+  * indexes and keys are created with the table itself, and so exactly once: see
+  * [[createIfNotExists]].
   *
   * @param profile
   *   The Slick profile of the host application's database.
   *
   * @param prefix
   *   Prepended to every table name, for applications that need this library's
-  *   tables to sit in a namespace of their own.
+  *   tables to sit in a namespace of their own. It goes into the identifiers
+  *   themselves, so it must be a constant the application chooses, never
+  *   anything that arrived in a request.
   */
 final class AuthTables
   (
@@ -32,10 +36,6 @@ final class AuthTables
 
   import profile.api.*
 
-  /**
-    * The context the schema actions' combinators run on: inline on the
-    * database's own threads, as each is a trivial, non-blocking step.
-    */
   /**
     * One registered user. The password column holds a salted hash in the format
     * produced by [[Passwords]], never a password.
@@ -48,16 +48,25 @@ final class AuthTables
 
     override def * = (id, username, passwordHash).mapTo[UserRow]
 
-  /** One sign-in session, expiring at a time this library enforces itself. */
+  /**
+    * One sign-in session, expiring at a time this library enforces itself. The
+    * column holds the hash of the token, never the token; it keeps its name so
+    * that a database created by an earlier version goes on working, with its
+    * sessions simply no longer resolving.
+    */
   final class Sessions
     (tag: Tag)
     extends Table[SessionRow](tag, s"${ prefix }sessions"):
 
-    def token   = column[String]("token", O.PrimaryKey)
-    def userId  = column[Long]("user_id")
-    def expires = column[Long]("expires")
+    def tokenHash = column[String]("token", O.PrimaryKey)
+    def userId    = column[Long]("user_id")
+    def expires   = column[Long]("expires")
 
-    override def * = (token, userId, expires).mapTo[SessionRow]
+    def bySession = index(s"${ prefix }sessions_user", userId)
+
+    def byExpiry = index(s"${ prefix }sessions_expiry", expires)
+
+    override def * = (tokenHash, userId, expires).mapTo[SessionRow]
 
   /** One user group, nested inside another via its `parent` column. */
   final class Groups
@@ -69,6 +78,8 @@ final class AuthTables
     def name   = column[String]("name")
     def parent = column[Option[Long]]("parent")
 
+    def byOwner = index(s"${ prefix }groups_owner", owner)
+
     override def * = (id, owner, name, parent).mapTo[GroupRow]
 
   /** One user's membership of one group. */
@@ -78,6 +89,13 @@ final class AuthTables
 
     def groupId = column[Long]("group_id")
     def userId  = column[Long]("user_id")
+
+    def byGroup = index(
+      s"${ prefix }members_group",
+      (groupId, userId),
+    )
+
+    def byMember = index(s"${ prefix }members_user", userId)
 
     override def * = (groupId, userId).mapTo[MemberRow]
 
@@ -89,6 +107,13 @@ final class AuthTables
     def id      = column[Long]("id", O.PrimaryKey, O.AutoInc)
     def groupId = column[Long]("group_id")
     def userId  = column[Long]("user_id")
+
+    def byGroup = index(
+      s"${ prefix }invitations_group",
+      (groupId, userId),
+    )
+
+    def byInvitee = index(s"${ prefix }invitations_user", userId)
 
     override def * = (id, groupId, userId).mapTo[InvitationRow]
 
@@ -110,6 +135,16 @@ final class AuthTables
     def principalId   = column[Long]("principal_id")
     def access        = column[String]("access")
 
+    def byResource = index(
+      s"${ prefix }grants_resource",
+      (resourceKind, resourceId),
+    )
+
+    def byPrincipal = index(
+      s"${ prefix }grants_principal",
+      (principalKind, principalId),
+    )
+
     override def * = (
       id,
       resourceKind,
@@ -127,6 +162,8 @@ final class AuthTables
     def id       = column[Long]("id", O.PrimaryKey, O.AutoInc)
     def userId   = column[Long]("user_id")
     def codeHash = column[String]("code_hash")
+
+    def byOwner = index(s"${ prefix }codes_user", userId)
 
     override def * = (id, userId, codeHash).mapTo[RecoveryCodeRow]
 
@@ -153,17 +190,36 @@ final class AuthTables
 
   /**
     * Creates any of this library's tables that the database does not already
-    * have. Safe to run on every startup, and alongside the host application's
-    * own schema creation. There are no migrations: a table whose shape has
-    * changed since an older database was created is not altered, so such a
-    * database must be recreated.
+    * have, each with its indexes, and leaves every table it does have exactly
+    * as it is. Safe to run on every startup, and alongside the host
+    * application's own schema creation. There are no migrations: a table whose
+    * shape has changed since an older database was created is not altered, so
+    * such a database must be recreated.
+    *
+    * Which tables are missing is asked of the database's own metadata, rather
+    * than left to `CREATE TABLE IF NOT EXISTS`, because that guards only the
+    * table: Slick emits an index, a composite key or a foreign key as a
+    * statement of its own, which a second startup would replay and fail on.
     */
-  def createIfNotExists: DBIO[Unit] = schema.createIfNotExists
+  def createIfNotExists: DBIO[Unit] = MTable
+    .getTables
+    .flatMap(held => DBIO.seq(absent(held.map(_.name.name.toLowerCase).toSet)*))
 
-  /** The combined schema of every table this library stores its data in. */
-  private def schema = users.schema ++ sessions.schema ++ groups.schema ++
-    members.schema ++ invitations.schema ++ grants.schema ++
-    recoveryCodes.schema
+  /** Creates each of this library's tables that is not among the given names. */
+  private def absent(held: Set[String]): Seq[DBIO[Unit]] = tables
+    .filterNot(table => held(table.baseTableRow.tableName.toLowerCase))
+    .map(_.schema.create)
+
+  /** Every table this library stores its data in. */
+  private def tables: Seq[TableQuery[? <: Table[?]]] = Seq(
+    users,
+    sessions,
+    groups,
+    members,
+    invitations,
+    grants,
+    recoveryCodes,
+  )
 
 /**
   * One registered user, flattened into a database row.
@@ -191,8 +247,10 @@ final case class UserRow
 /**
   * One sign-in session, flattened into a database row.
   *
-  * @param token
-  *   The secret bearer token held in the browser's session cookie.
+  * @param tokenHash
+  *   The hash of the secret bearer token held in the browser's session cookie,
+  *   as [[Digest]] produces it. The token itself is never stored, so a stolen
+  *   copy of this table is not a set of usable sessions.
   *
   * @param userId
   *   The identifier of the signed-in user.
@@ -202,7 +260,12 @@ final case class UserRow
   *   server-side, so that a leaked token does not outlive it however long the
   *   browser chooses to keep the cookie.
   */
-final case class SessionRow(token: String, userId: Long, expires: Long)
+final case class SessionRow
+  (
+    tokenHash: String,
+    userId: Long,
+    expires: Long,
+  )
 
 /**
   * One user group, flattened into a database row.

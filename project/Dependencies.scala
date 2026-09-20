@@ -16,11 +16,21 @@ object Dependencies:
     val laminar         = "17.0.0"
     val laminext        = "0.17.0"
     val munitCatsEffect = "2.2.0"
+    val sttpClient      = "3.11.0"
 
   /** Library dependencies associated with Tapir, for defining API endpoints. */
   lazy val tapir = libraryDependencies ++= Seq(
     "com.softwaremill.sttp.tapir" %% "tapir-core"       % V.tapir,
     "com.softwaremill.sttp.tapir" %% "tapir-json-circe" % V.tapir,
+  )
+
+  /**
+    * Tapir's stub interpreter, which serves endpoints in memory, for testing
+    * what a request to one actually answers without opening a socket.
+    */
+  lazy val tapirStub = libraryDependencies ++= Seq(
+    "com.softwaremill.sttp.tapir" %% "tapir-sttp-stub-server" % V.tapir % Test,
+    "com.softwaremill.sttp.client3" %% "cats" % V.sttpClient % Test,
   )
 
   /** Library dependencies associated with Circe, for JSON parsing. */
