@@ -296,11 +296,11 @@ class GroupStoreSuite extends CatsEffectSuite:
       yield
         assertEquals(
           stolen,
-          Some("The invitation does not exist."),
+          Some("That invitation doesn't exist."),
         )
         assertEquals(
           again,
-          Some("The invitation does not exist."),
+          Some("That invitation doesn't exist."),
         )
         assertEquals(members, List(employee))
 
@@ -360,7 +360,7 @@ class GroupStoreSuite extends CatsEffectSuite:
       yield
         assertEquals(
           late,
-          Some("The invitation does not exist."),
+          Some("That invitation doesn't exist."),
         )
         assertEquals(members, List.empty)
 
@@ -453,7 +453,7 @@ class GroupStoreSuite extends CatsEffectSuite:
         refused <- refusal(groups.invite(owner.id, team.id, "nobody"))
       yield assertEquals(
         refused,
-        Some("No user is named \"nobody\"."),
+        Some("No user is called \"nobody\"."),
       )
 
   test("inviting into another's group reads like a group that does not exist"):
@@ -468,7 +468,7 @@ class GroupStoreSuite extends CatsEffectSuite:
       yield
         assertEquals(
           foreign,
-          Some("The group does not exist."),
+          Some("That group doesn't exist."),
         )
         assertEquals(foreign, absent)
 
