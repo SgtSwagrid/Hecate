@@ -30,6 +30,10 @@ class PasswordsSuite extends CatsEffectSuite:
       "12:%%%:###",
       "120000::",
       "",
+      // A count no thread should obey, and one no derivation can use.
+      "999999999999:c2FsdHk=:aGFzaHk=",
+      "0:c2FsdHk=:aGFzaHk=",
+      "-1:c2FsdHk=:aGFzaHk=",
     ).traverse_(Passwords.verify("anything", _).assertEquals(false))
 
   test("no password verifies against the decoy"):
@@ -49,3 +53,11 @@ class PasswordsSuite extends CatsEffectSuite:
         assert(salt.nonEmpty)
         assert(hash.nonEmpty)
       case other => fail(s"The decoy is malformed: ${ other.mkString(":") }")
+
+  test("a hash derived under fewer rounds is the one marked outdated"):
+    Passwords
+      .hash("correct horse battery staple")
+      .map: hash =>
+        assert(Passwords.outdated(hash, 10000000))
+        assert(!Passwords.outdated(hash, 1))
+        assert(!Passwords.outdated("nonsense", 10000000))

@@ -1,6 +1,7 @@
 package com.alecdorrington.hecate
 package api
 
+import com.alecdorrington.hecate.api.Schemas.given
 import com.alecdorrington.hecate.model.{
   AuthRules, Credentials, PasswordChange, PasswordCheck, Recovery,
   RecoveryCodes, User,
@@ -25,13 +26,21 @@ import sttp.tapir.json.circe.*
   */
 object AuthApi:
 
-  private given Schema[User]           = Schema.derived
-  private given Schema[Credentials]    = Schema.derived
-  private given Schema[AuthRules]      = Schema.derived
-  private given Schema[PasswordChange] = Schema.derived
-  private given Schema[PasswordCheck]  = Schema.derived
-  private given Schema[Recovery]       = Schema.derived
-  private given Schema[RecoveryCodes]  = Schema.derived
+  /**
+    * The most characters a username may have. Long enough for any name a person
+    * would choose, and short enough that nothing unbounded is ever stored or
+    * compared.
+    */
+  val maxUsernameLength = Schemas.maxNameLength
+
+  /**
+    * The most characters a password may have. Deriving a hash costs time in
+    * proportion to the password's length, unauthenticated and on a pinned
+    * thread, so a password no person would type is refused at the edge rather
+    * than hashed. Long enough for any passphrase, and for any password a
+    * manager would generate.
+    */
+  val maxPasswordLength = Schemas.maxPasswordLength
 
   /** The name of the cookie that holds the session token. */
   val sessionCookie = "auth_session"
@@ -45,6 +54,31 @@ object AuthApi:
     */
   type Security = (Option[String], Option[String])
 
+  /**
+    * The shape of every endpoint here that requires a signed-in user: its
+    * security logic answers a caller, its inputs and outputs vary, and it is
+    * refused with a sentence.
+    *
+    * @tparam I
+    *   What the request carries.
+    *
+    * @tparam O
+    *   What the reply carries.
+    */
+  type Secured[I, O] = Endpoint[Security, I, String, O, Any]
+
+  /**
+    * The shape of every endpoint here that anybody may call, refused with a
+    * sentence in the same way.
+    *
+    * @tparam I
+    *   What the request carries.
+    *
+    * @tparam O
+    *   What the reply carries.
+    */
+  type Open[I, O] = PublicEndpoint[I, String, O, Any]
+
   /** The language cookie, as an input of an endpoint that is not secured. */
   private def language = cookie[Option[String]](languageCookie)
 
@@ -54,7 +88,7 @@ object AuthApi:
     * cookie to a [[com.alecdorrington.hecate.model.Caller]], or explains why it
     * cannot, in the language the language cookie asks for.
     */
-  val secured: Endpoint[Security, Unit, String, Unit, Any] = endpoint
+  val secured: Secured[Unit, Unit] = endpoint
     .securityIn(cookie[Option[String]](sessionCookie))
     .securityIn(language)
     .errorOut(stringBody)
@@ -64,11 +98,9 @@ object AuthApi:
     * session cookie.
     */
   val register
-    : PublicEndpoint[
+    : Open[
       (Credentials, Option[String]),
-      String,
       (User, CookieValueWithMeta),
-      Any,
     ] = endpoint
     .post
     .in("api" / "auth" / "register")
@@ -83,11 +115,9 @@ object AuthApi:
     * cookie.
     */
   val login
-    : PublicEndpoint[
+    : Open[
       (Credentials, Option[String]),
-      String,
       (User, CookieValueWithMeta),
-      Any,
     ] = endpoint
     .post
     .in("api" / "auth" / "login")
@@ -101,13 +131,7 @@ object AuthApi:
     * An endpoint that signs the current user out, closing their session and
     * clearing the session cookie.
     */
-  val logout
-    : PublicEndpoint[
-      Option[String],
-      String,
-      CookieValueWithMeta,
-      Any,
-    ] = endpoint
+  val logout: Open[Option[String], CookieValueWithMeta] = endpoint
     .post
     .in("api" / "auth" / "logout")
     .in(cookie[Option[String]](sessionCookie))
@@ -115,13 +139,7 @@ object AuthApi:
     .errorOut(stringBody)
 
   /** An endpoint that identifies the signed-in user, if any. */
-  val me
-    : PublicEndpoint[
-      Option[String],
-      String,
-      Option[User],
-      Any,
-    ] = endpoint
+  val me: Open[Option[String], Option[User]] = endpoint
     .get
     .in("api" / "auth" / "me")
     .in(cookie[Option[String]](sessionCookie))
@@ -132,7 +150,7 @@ object AuthApi:
     * An endpoint that describes the rules for accounts, so that a client can
     * state them before a request is refused.
     */
-  val rules: PublicEndpoint[Unit, String, AuthRules, Any] = endpoint
+  val rules: Open[Unit, AuthRules] = endpoint
     .get
     .in("api" / "auth" / "rules")
     .out(jsonBody[AuthRules])
@@ -143,14 +161,7 @@ object AuthApi:
     * current one. Signs out every other session, and replaces this one's cookie
     * with a fresh session.
     */
-  val changePassword
-    : Endpoint[
-      Security,
-      PasswordChange,
-      String,
-      CookieValueWithMeta,
-      Any,
-    ] = secured
+  val changePassword: Secured[PasswordChange, CookieValueWithMeta] = secured
     .put
     .in("api" / "auth" / "password")
     .in(jsonBody[PasswordChange])
@@ -161,21 +172,14 @@ object AuthApi:
     * given their password, invalidating every earlier code. The codes are
     * returned this once, and never again.
     */
-  val recoveryCodes
-    : Endpoint[
-      Security,
-      PasswordCheck,
-      String,
-      RecoveryCodes,
-      Any,
-    ] = secured
+  val recoveryCodes: Secured[PasswordCheck, RecoveryCodes] = secured
     .post
     .in("api" / "auth" / "recovery-codes")
     .in(jsonBody[PasswordCheck])
     .out(jsonBody[RecoveryCodes])
 
   /** An endpoint that counts the signed-in user's unused recovery codes. */
-  val recoveryCodesLeft: Endpoint[Security, Unit, String, Int, Any] = secured
+  val recoveryCodesLeft: Secured[Unit, Int] = secured
     .get
     .in("api" / "auth" / "recovery-codes")
     .out(jsonBody[Int])
@@ -186,11 +190,9 @@ object AuthApi:
     * other session, and signs in.
     */
   val recover
-    : PublicEndpoint[
+    : Open[
       (Recovery, Option[String]),
-      String,
       (User, CookieValueWithMeta),
-      Any,
     ] = endpoint
     .post
     .in("api" / "auth" / "recover")
@@ -204,14 +206,7 @@ object AuthApi:
     * An endpoint that deletes the signed-in user's account and everything that
     * belongs to it, given their password, and clears the session cookie.
     */
-  val deleteAccount
-    : Endpoint[
-      Security,
-      PasswordCheck,
-      String,
-      CookieValueWithMeta,
-      Any,
-    ] = secured
+  val deleteAccount: Secured[PasswordCheck, CookieValueWithMeta] = secured
     .post
     .in("api" / "auth" / "account" / "delete")
     .in(jsonBody[PasswordCheck])

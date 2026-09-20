@@ -5,7 +5,6 @@ import cats.effect.IO
 import cats.syntax.all.*
 import com.alecdorrington.hecate.model.User
 import java.sql.SQLException
-import scala.concurrent.ExecutionContext
 import scala.util.{Failure, Success}
 
 /**
@@ -22,11 +21,14 @@ final class UserStore(tables: AuthTables, db: Transactor):
 
   import tables.profile.api.*
 
-  private given ExecutionContext = ExecutionContext.parasitic
-
   /**
     * Stores a new user under the given password hash, or returns `None` when
     * the username is already taken.
+    *
+    * Surrounding space is trimmed by the service before it arrives here, but
+    * nothing else is: the name is stored as given and matched exactly, letter
+    * case and all. A host wanting `Alice` and `alice` to be one account folds
+    * the case itself, before registering and before signing in.
     *
     * The username column is unique in the database itself, so the insert alone
     * decides: checking first would not help, as two registrations racing for
@@ -57,11 +59,15 @@ final class UserStore(tables: AuthTables, db: Transactor):
     * decide which of these users the caller may see before calling this, and
     * must never expose it directly, or it becomes a directory of every account.
     */
-  def named(ids: Seq[Long]): IO[Map[Long, User]] =
-    if ids.isEmpty then IO.pure(Map.empty)
-    else
-      db.run(tables.users.filter(_.id inSet ids.distinct).result)
-        .map(_.map(row => row.id -> row.toUser).toMap)
+  def byIds(ids: Seq[Long]): IO[Map[Long, User]] = db.run(
+    ifAny(ids.distinct)(Map.empty)(found =>
+      tables
+        .users
+        .filter(_.id inSet found)
+        .result
+        .map(_.map(row => row.id -> row.toUser).toMap),
+    ),
+  )
 
   /** Finds one stored user by identifier, including their password hash. */
   def findById(user: Long): IO[Option[UserRow]] =
@@ -69,13 +75,20 @@ final class UserStore(tables: AuthTables, db: Transactor):
 
   /**
     * Opens a sign-in session for the given user under the given token, expiring
-    * at the given time.
+    * at the given time. Only the hash of the token is stored, so that a stolen
+    * copy of the table is not a set of usable sessions.
     */
   def openSession(token: String, user: Long, expires: Long): IO[Unit] = db
-    .run(tables.sessions += SessionRow(token, user, expires))
+    .run(tables.sessions += SessionRow(Digest.of(token), user, expires))
     .void
 
-  /** Deletes every session that has expired, whoever it belonged to. */
+  /**
+    * Deletes every session that has expired, whoever it belonged to. Nothing
+    * here calls this: an expired session is refused by [[sessionUser]] whether
+    * or not its row is still there, so this is housekeeping, and a host
+    * application schedules it as it sees fit rather than paying for it inside
+    * somebody else's request.
+    */
   def purgeExpired: IO[Unit] = IO
     .realTime
     .flatMap(now =>
@@ -90,7 +103,8 @@ final class UserStore(tables: AuthTables, db: Transactor):
         tables
           .sessions
           .filter(session =>
-            session.token === token && session.expires > now.toMillis,
+            session.tokenHash === Digest.of(token) &&
+            session.expires > now.toMillis,
           )
           .join(tables.users)
           .on(_.userId === _.id)
@@ -103,7 +117,7 @@ final class UserStore(tables: AuthTables, db: Transactor):
 
   /** Closes the session with the given token, signing its user out. */
   def closeSession(token: String): IO[Unit] = db
-    .run(tables.sessions.filter(_.token === token).delete)
+    .run(tables.sessions.filter(_.tokenHash === Digest.of(token)).delete)
     .void
 
   /**
@@ -136,18 +150,41 @@ final class UserStore(tables: AuthTables, db: Transactor):
       token: String,
       expires: Long,
     )
-    : IO[Option[User]] = db.run((for
-    found <- byUsername(username).result.headOption
-    // Deleting the code both checks it and uses it up in one step, so that
-    // two recoveries racing with the same code cannot both succeed.
-    used <- found.fold[DBIO[Int]](DBIO.successful(0))(row =>
-      codeOf(row.id, codeHash).delete,
+    : IO[Option[User]] = db.run(
+    byUsername(username)
+      .result
+      .headOption
+      .flatMap(regain(_, codeHash, passwordHash, token, expires))
+      .transactionally,
+  )
+
+  /**
+    * Regains the given account, if there is one and the code is one of its
+    * unused codes, and answers with nobody otherwise.
+    */
+  private def regain
+    (
+      found: Option[UserRow],
+      codeHash: String,
+      passwordHash: String,
+      token: String,
+      expires: Long,
     )
-    user <- found match
-      case Some(row) if used == 1 =>
+    : DBIO[Option[User]] = found.fold(DBIO.successful(None))(row =>
+    claim(row.id, codeHash).flatMap(claimed =>
+      if claimed then
         reset(row.id, passwordHash, token, expires).map(_ => Some(row.toUser))
-      case _ => DBIO.successful(None)
-  yield user).transactionally)
+      else DBIO.successful(None),
+    ),
+  )
+
+  /**
+    * Uses up one of a user's recovery codes, answering whether it was one of
+    * theirs. Deleting it both checks it and claims it in one step, so that two
+    * recoveries racing with the same code cannot both succeed.
+    */
+  private def claim(user: Long, codeHash: String): DBIO[Boolean] =
+    codeOf(user, codeHash).delete.map(_ == 1)
 
   /**
     * Replaces every recovery code of the given user with the given set, so that
@@ -166,6 +203,21 @@ final class UserStore(tables: AuthTables, db: Transactor):
   /** How many unused recovery codes the given user has left. */
   def recoveryCodesLeft(user: Long): IO[Int] =
     db.run(codesOf(user).length.result)
+
+  /**
+    * Replaces one user's password hash, leaving their sessions alone: the
+    * password itself has not changed, only the cost it is stored under, so
+    * nobody need be signed out.
+    */
+  private[server] def rehash(user: Long, passwordHash: String): IO[Unit] = db
+    .run(
+      tables
+        .users
+        .filter(_.id === user)
+        .map(_.passwordHash)
+        .update(passwordHash),
+    )
+    .void
 
   /**
     * Removes one user's sessions, recovery codes and account. Composes into an
@@ -188,7 +240,7 @@ final class UserStore(tables: AuthTables, db: Transactor):
     : DBIO[Unit] = DBIO.seq(
     tables.users.filter(_.id === user).map(_.passwordHash).update(passwordHash),
     tables.sessions.filter(_.userId === user).delete,
-    tables.sessions += SessionRow(token, user, expires),
+    tables.sessions += SessionRow(Digest.of(token), user, expires),
   )
 
   /** The query for the stored user with the given username. */

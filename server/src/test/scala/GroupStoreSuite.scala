@@ -12,13 +12,9 @@ import com.alecdorrington.hecate.model.{
   Access, Grant, GroupDraft, Invitation, Principal, Resource, User,
 }
 import munit.CatsEffectSuite
-import scala.concurrent.ExecutionContext
 import slick.jdbc.{H2Profile, JdbcCapabilities, SQLiteProfile}
 
 class GroupStoreSuite extends CatsEffectSuite:
-
-  /** Runs the cascade hook's query combinators inline, as the stores do. */
-  private given ExecutionContext = ExecutionContext.parasitic
 
   /** Runs a check against stores backed by a fresh in-memory database. */
   private def withStores
@@ -67,7 +63,7 @@ class GroupStoreSuite extends CatsEffectSuite:
       for
         owner <- newUser(users, "manager")
         made  <- groups.create(owner.id, GroupDraft("Sales"))
-        all   <- groups.list(owner.id)
+        all   <- groups.owned(owner.id)
       yield
         assertEquals(all.map(_.group), List(made))
         assertEquals(all.flatMap(_.members), List.empty)
@@ -79,7 +75,7 @@ class GroupStoreSuite extends CatsEffectSuite:
         alice <- newUser(users, "alice")
         bob   <- newUser(users, "bob")
         _     <- groups.create(alice.id, GroupDraft("Sales"))
-        seen  <- groups.list(bob.id)
+        seen  <- groups.owned(bob.id)
       yield assertEquals(seen, List.empty)
 
   test("groups nest to arbitrary depth via their parent"):
@@ -95,7 +91,7 @@ class GroupStoreSuite extends CatsEffectSuite:
           owner.id,
           GroupDraft("Front desk", Some(team.id)),
         )
-        all <- groups.list(owner.id)
+        all <- groups.owned(owner.id)
       yield assertEquals(
         all.map(view => (view.group.name, view.group.parent)),
         List(
@@ -157,7 +153,7 @@ class GroupStoreSuite extends CatsEffectSuite:
           team.id,
           GroupDraft("10B", Some(dept.id)),
         )
-        all <- groups.list(owner.id)
+        all <- groups.owned(owner.id)
       yield assertEquals(
         all.map(view => (view.group.name, view.group.parent)),
         List(("Sales", None), ("10B", Some(dept.id))),
@@ -178,7 +174,7 @@ class GroupStoreSuite extends CatsEffectSuite:
         _       <- join(groups, owner, team.id, employee)
         _       <- groups.invite(owner.id, team.id, "invited")
         _       <- groups.delete(owner.id, dept.id)
-        all     <- groups.list(owner.id)
+        all     <- groups.owned(owner.id)
         theirs  <- groups.groupIdsOf(employee.id)
         pending <- groups.invitations(invited.id)
       yield
@@ -193,7 +189,7 @@ class GroupStoreSuite extends CatsEffectSuite:
         bob     <- newUser(users, "bob")
         theirs  <- groups.create(alice.id, GroupDraft("Sales"))
         attempt <- groups.delete(bob.id, theirs.id).attempt
-        all     <- groups.list(alice.id)
+        all     <- groups.owned(alice.id)
       yield
         assert(attempt.isLeft)
         assertEquals(all.map(_.group), List(theirs))
@@ -248,7 +244,7 @@ class GroupStoreSuite extends CatsEffectSuite:
         employee <- newUser(users, "employee")
         team     <- groups.create(owner.id, GroupDraft("Retail"))
         _        <- groups.invite(owner.id, team.id, "employee")
-        view     <- groups.list(owner.id).map(_.head)
+        view     <- groups.owned(owner.id).map(_.head)
         sent     <- groups.invitations(employee.id)
         reached  <- groups.groupIdsOf(employee.id)
         joined   <- groups.memberships(employee.id)
@@ -271,7 +267,7 @@ class GroupStoreSuite extends CatsEffectSuite:
           GroupDraft("Retail", Some(dept.id)),
         )
         _       <- join(groups, owner, team.id, employee)
-        view    <- groups.list(owner.id).map(_.find(_.group.id == team.id).get)
+        view    <- groups.owned(owner.id).map(_.find(_.group.id == team.id).get)
         sent    <- groups.invitations(employee.id)
         reached <- groups.groupIdsOf(employee.id)
       yield
@@ -292,7 +288,7 @@ class GroupStoreSuite extends CatsEffectSuite:
         stolen   <- refusal(groups.accept(stranger.id, sent.id))
         _        <- groups.accept(employee.id, sent.id)
         again    <- refusal(groups.accept(employee.id, sent.id))
-        members  <- groups.list(owner.id).map(_.flatMap(_.members))
+        members  <- groups.owned(owner.id).map(_.flatMap(_.members))
       yield
         assertEquals(
           stolen,
@@ -323,7 +319,7 @@ class GroupStoreSuite extends CatsEffectSuite:
         team     <- groups.create(owner.id, GroupDraft("Retail"))
         _        <- join(groups, owner, team.id, employee)
         _        <- groups.invite(owner.id, team.id, "employee")
-        view     <- groups.list(owner.id).map(_.head)
+        view     <- groups.owned(owner.id).map(_.head)
       yield
         assertEquals(view.members, List(employee))
         assertEquals(view.invitees, List.empty)
@@ -337,10 +333,10 @@ class GroupStoreSuite extends CatsEffectSuite:
         _        <- groups.invite(owner.id, team.id, "employee")
         sent     <- invitationTo(groups, employee, team.id)
         _        <- groups.decline(employee.id, sent.id)
-        declined <- groups.list(owner.id).map(_.head.invitees)
+        declined <- groups.owned(owner.id).map(_.head.invitees)
         held     <- groups.invitations(employee.id)
         _        <- groups.invite(owner.id, team.id, "employee")
-        again    <- groups.list(owner.id).map(_.head.invitees)
+        again    <- groups.owned(owner.id).map(_.head.invitees)
       yield
         assertEquals(declined, List.empty)
         assertEquals(held, List.empty)
@@ -356,7 +352,7 @@ class GroupStoreSuite extends CatsEffectSuite:
         sent     <- invitationTo(groups, employee, team.id)
         _        <- groups.decline(employee.id, sent.id)
         late     <- refusal(groups.accept(employee.id, sent.id))
-        members  <- groups.list(owner.id).map(_.head.members)
+        members  <- groups.owned(owner.id).map(_.head.members)
       yield
         assertEquals(
           late,
@@ -375,7 +371,7 @@ class GroupStoreSuite extends CatsEffectSuite:
         joined   <- groups.memberships(employee.id)
         reached  <- groups.groupIdsOf(employee.id)
         _        <- groups.invite(owner.id, team.id, "employee")
-        view     <- groups.list(owner.id).map(_.head)
+        view     <- groups.owned(owner.id).map(_.head)
       yield
         assertEquals(joined, List.empty)
         assertEquals(reached, List.empty)
@@ -423,9 +419,9 @@ class GroupStoreSuite extends CatsEffectSuite:
         team     <- groups.create(owner.id, GroupDraft("Retail"))
         _        <- join(groups, owner, team.id, employee)
         _        <- groups.withdraw(owner.id, team.id, employee.id)
-        removed  <- groups.list(owner.id).map(_.head)
+        removed  <- groups.owned(owner.id).map(_.head)
         _        <- groups.invite(owner.id, team.id, "employee")
-        again    <- groups.list(owner.id).map(_.head.invitees)
+        again    <- groups.owned(owner.id).map(_.head.invitees)
       yield
         assertEquals(removed.members, List.empty)
         assertEquals(removed.invitees, List.empty)
@@ -439,7 +435,7 @@ class GroupStoreSuite extends CatsEffectSuite:
         team     <- groups.create(owner.id, GroupDraft("Retail"))
         _        <- groups.invite(owner.id, team.id, "employee")
         _        <- groups.withdraw(owner.id, team.id, employee.id)
-        view     <- groups.list(owner.id).map(_.head)
+        view     <- groups.owned(owner.id).map(_.head)
         sent     <- groups.invitations(employee.id)
       yield
         assertEquals(view.invitees, List.empty)
@@ -494,6 +490,30 @@ class GroupStoreSuite extends CatsEffectSuite:
         List(dept.id, team.id, row.id).sorted,
       )
 
+  test("effective groups are the member's own, whoever else owns groups"):
+    withStores("ancestors-other-owners"): (groups, users) =>
+      for
+        owner    <- newUser(users, "manager")
+        stranger <- newUser(users, "stranger")
+        employee <- newUser(users, "employee")
+        dept     <- groups.create(owner.id, GroupDraft("Sales"))
+        team     <- groups.create(
+          owner.id,
+          GroupDraft("Retail", Some(dept.id)),
+        )
+        // Another owner's forest, which the walk must neither read nor reach.
+        theirs <- groups.create(stranger.id, GroupDraft("Accounts"))
+        _      <- groups.create(
+          stranger.id,
+          GroupDraft("Payroll", Some(theirs.id)),
+        )
+        _    <- join(groups, owner, team.id, employee)
+        mine <- groups.groupIdsOf(employee.id)
+        none <- groups.groupIdsOf(stranger.id)
+      yield
+        assertEquals(mine, List(dept.id, team.id).sorted)
+        assertEquals(none, List.empty)
+
   test("a membership of a group that no longer exists reaches nothing"):
     TestDb
       .open("groups-orphan")
@@ -537,7 +557,7 @@ class GroupStoreSuite extends CatsEffectSuite:
         team     <- groups.create(owner.id, GroupDraft("Retail"))
         _        <- join(groups, owner, team.id, employee)
         _        <- groups.leave(other.id, team.id)
-        view     <- groups.list(owner.id).map(_.head)
+        view     <- groups.owned(owner.id).map(_.head)
       yield
         assertEquals(view.members, List(employee))
         assertEquals(view.invitees, List.empty)

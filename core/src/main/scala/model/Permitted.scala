@@ -9,9 +9,9 @@ import io.circe.Codec
   * travels beside a value rather than inside it.
   *
   * @param item
-  *   The value.
+  *   The value itself.
   *
   * @param access
   *   The access that the reader holds over the value.
   */
-final case class Permitted[X](item: X, access: Access) derives Codec.AsObject
+final case class Permitted[+X](item: X, access: Access) derives Codec.AsObject

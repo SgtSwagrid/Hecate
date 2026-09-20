@@ -56,6 +56,10 @@ final class AccountStore
     * with an [[AuthProblem]], and nothing is deleted; the user must first pass
     * those resources on, or delete them.
     *
+    * What counts as another owner is any principal holding `Own` that is not
+    * being deleted here, a group with no members included: see
+    * [[GrantStore.soleOwnerOf]] for what that does and does not promise.
+    *
     * The groups a user owns are not themselves a reason to refuse. A group has
     * exactly one owner by construction, and is deleted with them, which is why
     * their `Own` grants count for nothing here.
@@ -66,15 +70,48 @@ final class AccountStore
     * rest, or waits until the account is gone.
     */
   def delete(user: Long): IO[Unit] = db.run((for
-    _     <- tables.users.filter(_.id === user).forUpdate.result
-    owned <- tables.groups.filter(_.owner === user).map(_.id).result
-    doomed = Principal.Person(user) +: owned.map(Principal.Group(_))
-    orphaned <- grants.soleOwnerOf(doomed)
-    _        <-
-      if orphaned.isEmpty then DBIO.successful(())
-      else DBIO.failed(AuthProblem(AuthRefusal.SoleOwner(orphaned.size)))
-    _ <- groups.forget(user)
-    _ <- cascade(Seq(Principal.Person(user)))
-    _ <- grants.revokeHeldBy(Seq(Principal.Person(user)))
-    _ <- users.remove(user)
+    _      <- lock(user)
+    doomed <- doomedWith(user)
+    _      <- refuseOrphans(doomed)
+    _      <- remove(user)
   yield ()).transactionally)
+
+  /**
+    * Locks the user's row until the transaction ends, so that a grant written
+    * to them takes its turn with their deletion rather than outliving it.
+    */
+  private def lock(user: Long): DBIO[Unit] = tables
+    .users
+    .filter(_.id === user)
+    .forUpdate
+    .result
+    .map(_ => ())
+
+  /** The principals this deletion removes: the user, and the groups they own. */
+  private def doomedWith(user: Long): DBIO[Seq[Principal]] = tables
+    .groups
+    .filter(_.owner === user)
+    .map(_.id)
+    .result
+    .map(Principal.Person(user) +: _.map(Principal.Group(_)))
+
+  /**
+    * Fails the transaction, deleting nothing, if removing these principals
+    * together would leave a resource with no owner at all.
+    */
+  private def refuseOrphans(doomed: Seq[Principal]): DBIO[Unit] = grants
+    .soleOwnerOf(doomed)
+    .flatMap(orphaned =>
+      if orphaned.isEmpty then DBIO.successful(())
+      else DBIO.failed(AuthProblem(AuthRefusal.SoleOwner(orphaned.size))),
+    )
+
+  /** Removes everything that belongs to the user, and then the user. */
+  private def remove(user: Long): DBIO[Unit] =
+    val person = Seq(Principal.Person(user))
+    for
+      _ <- groups.forget(user)
+      _ <- cascade(person)
+      _ <- grants.revokeHeldBy(person)
+      _ <- users.remove(user)
+    yield ()

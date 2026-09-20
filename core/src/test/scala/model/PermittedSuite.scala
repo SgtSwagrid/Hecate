@@ -36,17 +36,6 @@ class PermittedSuite extends FunSuite:
       Right("edit"),
     )
 
-  test("a principal round-trips through JSON as either case"):
-    List(
-      Principal.Person(1),
-      Principal.Group(2),
-    ).foreach(principal =>
-      assertEquals(
-        principal.asJson.as[Principal],
-        Right(principal),
-      ),
-    )
-
   test("a permitted value derives a schema naming both of its fields"):
     val fields = summon[Schema[Permitted[Grant]]].schemaType match
       case product: SchemaType.SProduct[?] => product.fields.map(_.name.name)

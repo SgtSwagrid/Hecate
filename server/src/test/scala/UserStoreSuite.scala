@@ -4,6 +4,7 @@ package server
 import cats.effect.IO
 import cats.syntax.all.*
 import munit.CatsEffectSuite
+import slick.jdbc.H2Profile.api.*
 
 class UserStoreSuite extends CatsEffectSuite:
 
@@ -27,6 +28,23 @@ class UserStoreSuite extends CatsEffectSuite:
 
   test("an unknown username is not found"):
     withStore("unknown")(_.findByUsername("nobody").assertEquals(None))
+
+  test("a session is stored as the hash of its token, never the token"):
+    TestDb
+      .open("users-session-hash")
+      .use: db =>
+        val users = UserStore(TestDb.tables, db)
+        for
+          user   <- users.register("alice", "hash").map(_.get)
+          _      <- users.openSession("secret", user.id, UserStoreSuite.soon)
+          stored <- db.run(TestDb.tables.sessions.result)
+          found  <- users.sessionUser("secret")
+        yield
+          assertEquals(
+            stored.map(_.tokenHash),
+            Seq(Digest.of("secret")),
+          )
+          assertEquals(found, Some(user))
 
   test("an open session resolves to its user"):
     withStore("session"): users =>
@@ -91,6 +109,21 @@ class UserStoreSuite extends CatsEffectSuite:
         assertEquals((old1, old2), (None, None))
         assertEquals(fresh, Some(user))
 
+  test("rehashing a password leaves every session where it was"):
+    withStore("rehash"): users =>
+      for
+        user <- users.register("alice", "old").map(_.get)
+        _    <- users.openSession("laptop", user.id, UserStoreSuite.soon)
+        _    <- users.rehash(user.id, "stronger")
+        row  <- users.findById(user.id)
+        open <- users.sessionUser("laptop")
+      yield
+        assertEquals(
+          row.map(_.passwordHash),
+          Some("stronger"),
+        )
+        assertEquals(open, Some(user))
+
   test("a recovery code regains the account once, and only once"):
     withStore("recover"): users =>
       for
@@ -151,8 +184,8 @@ class UserStoreSuite extends CatsEffectSuite:
       for
         alice <- users.register("alice", "hash").map(_.get)
         bob   <- users.register("bob", "hash").map(_.get)
-        found <- users.named(List(alice.id, bob.id, alice.id, 9999L))
-        none  <- users.named(List.empty)
+        found <- users.byIds(List(alice.id, bob.id, alice.id, 9999L))
+        none  <- users.byIds(List.empty)
       yield
         assertEquals(
           found,

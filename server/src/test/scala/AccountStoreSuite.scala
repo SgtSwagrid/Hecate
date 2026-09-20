@@ -7,12 +7,8 @@ import com.alecdorrington.hecate.model.{
   Access, Grant, GroupDraft, Principal, Resource,
 }
 import munit.CatsEffectSuite
-import scala.concurrent.ExecutionContext
 
 class AccountStoreSuite extends CatsEffectSuite:
-
-  /** Runs the recording cascade's combinators inline, as the stores do. */
-  private given ExecutionContext = ExecutionContext.parasitic
 
   /** An expiry time comfortably in the future. */
   private val soon = System.currentTimeMillis + 60000
@@ -68,7 +64,7 @@ class AccountStoreSuite extends CatsEffectSuite:
           gone     <- users.findById(alice.id)
           session  <- users.sessionUser("alice-token")
           codes    <- users.recoveryCodesLeft(alice.id)
-          bobsView <- groups.list(bob.id)
+          bobsView <- groups.owned(bob.id)
           invited  <- groups.invitations(bob.id)
           left     <- grants.grantsOver(document)
         yield
@@ -120,7 +116,7 @@ class AccountStoreSuite extends CatsEffectSuite:
           refused <- accounts.delete(alice.id).attempt
           still   <- users.findById(alice.id)
           session <- users.sessionUser("alice-token")
-          view    <- groups.list(alice.id)
+          view    <- groups.owned(alice.id)
           left    <- grants.grantsOver(document)
         yield
           assertEquals(
@@ -199,7 +195,7 @@ class AccountStoreSuite extends CatsEffectSuite:
           his   <- groups.create(bob.id, GroupDraft("Bob's team"))
           _     <- accounts.delete(alice.id)
           still <- users.sessionUser("bob-token")
-          view  <- groups.list(bob.id)
+          view  <- groups.owned(bob.id)
         yield
           assertEquals(still, Some(bob))
           assertEquals(view.map(_.group), List(his))

@@ -57,6 +57,7 @@ lazy val hecateServer = project
     Dependencies.circe,
     Dependencies.catsEffect,
     Dependencies.database,
+    Dependencies.tapirStub,
     Dependencies.munitCatsEffect,
   )
 

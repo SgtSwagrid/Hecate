@@ -108,43 +108,48 @@ object Wording:
     */
   val english: Wording = new Wording:
 
-    val signedOut = "You need to sign in to do this."
+    override val signedOut: String = "You need to sign in to do this."
 
-    val usernameTaken = "That username is already taken."
+    override val usernameTaken: String = "That username is already taken."
 
-    val incorrectCredentials = "Incorrect username or password."
+    override val incorrectCredentials: String =
+      "Incorrect username or password."
 
-    val incorrectPassword = "Incorrect password."
+    override val incorrectPassword: String = "Incorrect password."
 
-    val incorrectRecovery = "Incorrect username or recovery code."
+    override val incorrectRecovery: String =
+      "Incorrect username or recovery code."
 
-    val noAccountDeletion = "Accounts can't be deleted here."
+    override val noAccountDeletion: String = "Accounts can't be deleted here."
 
-    val emptyUsername = "Username can't be empty."
+    override val emptyUsername: String = "Username can't be empty."
 
-    def passwordTooShort(min: Int) =
+    override def passwordTooShort(min: Int): String =
       s"Password must be at least $min characters."
 
-    def noSuchUser(username: String) = s"No user is called \"$username\"."
+    override def noSuchUser(username: String): String =
+      s"No user is called \"$username\"."
 
-    val groupMissing = "That group doesn't exist."
+    override val groupMissing: String = "That group doesn't exist."
 
-    val invitationMissing = "That invitation doesn't exist."
+    override val invitationMissing: String = "That invitation doesn't exist."
 
-    val parentGroupMissing = "The parent group doesn't exist."
+    override val parentGroupMissing: String = "The parent group doesn't exist."
 
-    val groupInsideItself = "A group can't be its own subgroup."
+    override val groupInsideItself: String =
+      "A group can't be its own subgroup."
 
-    def soleOwner(count: Int) =
+    override def soleOwner(count: Int): String =
       val things = if count == 1 then "1 thing" else s"$count things"
       s"You're the only owner of $things. Give them to someone else, or " +
         "delete them, before deleting your account."
 
-    val requestFailed = "Database request failed."
+    override val requestFailed: String = "The request couldn't be completed."
 
-    val unreadableReply = "The server sent a reply that couldn't be read."
+    override val unreadableReply: String =
+      "The server sent a reply that couldn't be read."
 
-    val unreachable = "The server couldn't be reached."
+    override val unreachable: String = "The server couldn't be reached."
 
-    val passwordChanged =
+    override val passwordChanged: String =
       "Your password has been changed, and every other session signed out."

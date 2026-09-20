@@ -2,8 +2,7 @@ package com.alecdorrington.hecate
 package server
 
 import cats.effect.IO
-import java.nio.charset.StandardCharsets
-import java.security.{MessageDigest, SecureRandom}
+import java.security.SecureRandom
 
 /**
   * One-time recovery codes, which regain an account whose password has been
@@ -36,11 +35,7 @@ object RecoveryCode:
     * The hash a code is stored as. Spacing, hyphens and letter case are
     * ignored, so that a code is accepted however it was copied out.
     */
-  def hash(code: String): String = MessageDigest
-    .getInstance("SHA-256")
-    .digest(normalise(code).getBytes(StandardCharsets.UTF_8))
-    .map(byte => f"$byte%02x")
-    .mkString
+  def hash(code: String): String = Digest.of(normalise(code))
 
   /** One fresh code, as two hyphenated groups of five. */
   private def fresh: String =

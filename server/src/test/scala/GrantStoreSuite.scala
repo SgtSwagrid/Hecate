@@ -418,3 +418,44 @@ class GrantStoreSuite extends CatsEffectSuite:
         )
         sole <- db.run(grants.soleOwnerOf(Seq(Principal.Person(1))))
       yield assertEquals(sole, Seq.empty)
+
+  test("reading the grants over a resource in a transaction agrees with out"):
+    withStore("granted"): (grants, db) =>
+      val give_ = give(grants, db)
+      for
+        _ <- give_(
+          document,
+          Principal.Person(1),
+          Access.Own,
+        )
+        _ <- give_(
+          document,
+          Principal.Group(2),
+          Access.View,
+        )
+        _ <- give_(
+          otherDocument,
+          Principal.Person(3),
+          Access.Edit,
+        )
+        inside <- db.run(grants.granted(document))
+        beside <- grants.grantsOver(document)
+      yield
+        assertEquals(inside.toSet, beside.toSet)
+        assertEquals(
+          inside.map(_.principal).toSet,
+          Set(
+            Principal.Person(1),
+            Principal.Group(2),
+          ),
+        )
+
+  test("a grant composed into one transaction is read back by it"):
+    withStore("granted-composed"): (grants, db) =>
+      val write = grants.grant(Grant(
+        document,
+        Principal.Person(1),
+        Access.Edit,
+      ))
+      db.run(write.andThen(grants.granted(document)).transactionally)
+        .map(held => assertEquals(held.map(_.access), List(Access.Edit)))

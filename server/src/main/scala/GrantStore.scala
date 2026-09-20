@@ -70,7 +70,7 @@ final class GrantStore(tables: AuthTables, db: Transactor):
     */
   private def lockPerson(principal: Principal): DBIO[Unit] = principal match
     case Principal.Person(id) =>
-      tables.users.filter(_.id === id).forUpdate.result.map(_ => ())
+      tables.users.filter(_.id === id).forUpdate.result.unit
     case Principal.Group(_) => DBIO.successful(())
 
   /**
@@ -87,7 +87,7 @@ final class GrantStore(tables: AuthTables, db: Transactor):
     *   An action withdrawing the grant, which does nothing if there is none.
     */
   def revoke(resource: Resource, principal: Principal): DBIO[Unit] =
-    held(resource, principal).delete.map(_ => ())
+    held(resource, principal).delete.unit
 
   /**
     * Withdraws every grant over one resource. No foreign key will ever remove a
@@ -103,9 +103,7 @@ final class GrantStore(tables: AuthTables, db: Transactor):
     * @return
     *   An action withdrawing every grant over the resource.
     */
-  def revokeAll(resource: Resource): DBIO[Unit] = over(resource)
-    .delete
-    .map(_ => ())
+  def revokeAll(resource: Resource): DBIO[Unit] = over(resource).delete.unit
 
   /**
     * Withdraws every grant held by any of the given principals, over any
@@ -120,21 +118,8 @@ final class GrantStore(tables: AuthTables, db: Transactor):
     *   An action withdrawing every such grant.
     */
   def revokeHeldBy(principals: Seq[Principal]): DBIO[Unit] =
-    val byKind = principals.groupMap(_.kind)(_.id)
-    // This guard is what makes the `reduce` below safe: never remove it.
-    if byKind.isEmpty then DBIO.successful(())
-    else
-      tables
-        .grants
-        .filter(row =>
-          byKind
-            .map((kind, ids) =>
-              row.principalKind === kind && (row.principalId inSet ids),
-            )
-            .reduce(_ || _),
-        )
-        .delete
-        .map(_ => ())
+    ifAny(principals)(()): held =>
+      tables.grants.filter(heldByAny(_, held)).delete.unit
 
   /**
     * The resources over which the given principals, between them, are the only
@@ -142,6 +127,13 @@ final class GrantStore(tables: AuthTables, db: Transactor):
     * with no owner at all. Any other holder, a group included, counts. Composes
     * into the caller's transaction and opens none of its own, so that a
     * deletion can refuse before removing anything.
+    *
+    * A surviving holder is a holder of the grant, not necessarily a person who
+    * can act on it: a group with no members at all counts, and so does one
+    * whose only members are being deleted alongside. What this guarantees is
+    * that some principal still holds `Own`, not that somebody can still reach
+    * the resource. Whether that is enough is the host application's to decide,
+    * since only it knows what its resources are worth.
     *
     * @param principals
     *   The users and groups about to be deleted together, such as a user and
@@ -218,7 +210,9 @@ final class GrantStore(tables: AuthTables, db: Transactor):
 
   /**
     * The identifiers of every resource of one kind over which one user holds at
-    * least the given access, resolved in a single query.
+    * least the given access, resolved in a single query, which asks the
+    * database for the grants that are high enough rather than reading every
+    * grant that reaches the user and sifting them here.
     *
     * @param user
     *   The identifier of the user.
@@ -244,9 +238,18 @@ final class GrantStore(tables: AuthTables, db: Transactor):
       kind: String,
       least: Access,
     )
-    : IO[Set[Long]] = levels(user, groups, kind).map(held =>
-    held.collect { case (id, level) if level.includes(least) => id }.toSet,
-  )
+    : IO[Set[Long]] = db
+    .run(
+      reaching(user, groups)
+        .filter(row =>
+          row.resourceKind === kind &&
+          (row.access inSet GrantStore.atLeast(least)),
+        )
+        .map(_.resourceId)
+        .distinct
+        .result,
+    )
+    .map(_.toSet)
 
   /**
     * The highest access one user holds over every resource of one kind that a
@@ -300,14 +303,21 @@ final class GrantStore(tables: AuthTables, db: Transactor):
   private def heldBy(row: tables.Grants, principal: Principal): Rep[Boolean] =
     row.principalKind === principal.kind && row.principalId === principal.id
 
-  /** Whether a grant row is held by any of the given principals. */
+  /**
+    * Whether a grant row is held by any of the given principals, asked one term
+    * per kind rather than one per principal, so that a long list of users is a
+    * single `IN`. No principals at all is nobody.
+    */
   private def heldByAny
     (
       row: tables.Grants,
       principals: Seq[Principal],
     )
     : Rep[Boolean] = principals
-    .map(heldBy(row, _))
+    .groupMap(_.kind)(_.id)
+    .map((kind, ids) =>
+      row.principalKind === kind && (row.principalId inSet ids),
+    )
     .reduceOption(_ || _)
     .getOrElse(LiteralColumn(false))
 
@@ -342,3 +352,16 @@ object GrantStore:
   private def highest(levels: Iterable[String]): Option[Access] = levels
     .flatMap(Access.fromName)
     .maxOption
+
+  /**
+    * The stored names of every level of access that includes the given one, for
+    * asking the database itself which grants are high enough. Levels are stored
+    * by name and compared by position, so the comparison travels as the set of
+    * names that satisfy it. A name this version does not recognise is not among
+    * them, so an unreadable grant confers nothing, exactly as in [[highest]].
+    */
+  private def atLeast(least: Access): Seq[String] = Access
+    .values
+    .filter(_.includes(least))
+    .map(_.name)
+    .toSeq

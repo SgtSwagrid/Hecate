@@ -23,7 +23,7 @@ import io.circe.syntax.*
   * under the name of its case, so that renaming a case in the code cannot
   * change what is sent.
   */
-enum Gated[+A]:
+enum Gated[+X]:
 
   /**
     * A part that exists and that the reader may see.
@@ -31,7 +31,7 @@ enum Gated[+A]:
     * @param value
     *   The part itself.
     */
-  case Shown(value: A)
+  case Shown(value: X)
 
   /** A part that does not exist, such as a review that was never written. */
   case Absent
@@ -68,7 +68,7 @@ object Gated:
     * value is always included when shown, even when it is itself `null`, so
     * that a part shown as nothing can never be read as an absent one.
     */
-  given encoder[A : Encoder]: Encoder.AsObject[Gated[A]] = Encoder
+  given encoder[X : Encoder]: Encoder.AsObject[Gated[X]] = Encoder
     .AsObject
     .instance:
       case Shown(value) => JsonObject(
@@ -79,12 +79,12 @@ object Gated:
       case Withheld => JsonObject("state" -> withheldState.asJson)
 
   /** Decodes a gated part from its state, refusing any unknown state. */
-  given decoder[A : Decoder]: Decoder[Gated[A]] = Decoder.instance: cursor =>
+  given decoder[X : Decoder]: Decoder[Gated[X]] = Decoder.instance: cursor =>
     cursor
       .downField("state")
       .as[String]
       .flatMap:
-        case `shownState`    => cursor.downField("value").as[A].map(Shown(_))
+        case `shownState`    => cursor.downField("value").as[X].map(Shown(_))
         case `absentState`   => Right(Absent)
         case `withheldState` => Right(Withheld)
         case other           => Left(DecodingFailure(

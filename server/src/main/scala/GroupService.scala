@@ -3,9 +3,10 @@ package server
 
 import cats.effect.IO
 import cats.effect.std.Console
-import com.alecdorrington.hecate.api.GroupApi
+import com.alecdorrington.hecate.api.{AuthApi, GroupApi}
 import com.alecdorrington.hecate.i18n.Wording
 import com.alecdorrington.hecate.model.Caller
+import sttp.tapir.Endpoint
 import sttp.tapir.server.ServerEndpoint
 
 /**
@@ -38,78 +39,54 @@ final class GroupService
     wording: Option[String] => Wording = _ => Wording.english,
   ):
 
+  private val failures = Failures(wording, report)
+
   /** An endpoint that lists the signed-in user's groups, with members. */
-  lazy val list: ServerEndpoint[Any, IO] = GroupApi
-    .list
-    .serverSecurityLogic(auth.require)
-    .serverLogic(user => _ => attempt(user)(groups.list(user.id)))
+  lazy val list: ServerEndpoint[Any, IO] =
+    served(GroupApi.list)(user => _ => groups.owned(user.id))
 
   /** An endpoint that lists the groups the signed-in user is a member of. */
-  lazy val mine: ServerEndpoint[Any, IO] = GroupApi
-    .mine
-    .serverSecurityLogic(auth.require)
-    .serverLogic(user => _ => attempt(user)(groups.memberships(user.id)))
+  lazy val mine: ServerEndpoint[Any, IO] =
+    served(GroupApi.mine)(user => _ => groups.memberships(user.id))
 
   /** An endpoint that withdraws the signed-in user from one group. */
-  lazy val leave: ServerEndpoint[Any, IO] = GroupApi
-    .leave
-    .serverSecurityLogic(auth.require)
-    .serverLogic(user => id => attempt(user)(groups.leave(user.id, id)))
+  lazy val leave: ServerEndpoint[Any, IO] =
+    served(GroupApi.leave)(user => id => groups.leave(user.id, id))
 
   /** An endpoint that stores a new group for the signed-in user. */
-  lazy val create: ServerEndpoint[Any, IO] = GroupApi
-    .create
-    .serverSecurityLogic(auth.require)
-    .serverLogic(user => draft => attempt(user)(groups.create(user.id, draft)))
+  lazy val create: ServerEndpoint[Any, IO] =
+    served(GroupApi.create)(user => draft => groups.create(user.id, draft))
 
   /** An endpoint that renames and/or moves one stored group. */
-  lazy val update: ServerEndpoint[Any, IO] = GroupApi
-    .update
-    .serverSecurityLogic(auth.require)
-    .serverLogic(user =>
-      (id, draft) => attempt(user)(groups.update(user.id, id, draft)),
-    )
+  lazy val update: ServerEndpoint[Any, IO] = served(GroupApi.update)(user =>
+    (id, draft) => groups.update(user.id, id, draft),
+  )
 
   /** An endpoint that deletes one stored group and its subgroups. */
-  lazy val delete: ServerEndpoint[Any, IO] = GroupApi
-    .delete
-    .serverSecurityLogic(auth.require)
-    .serverLogic(user => id => attempt(user)(groups.delete(user.id, id)))
+  lazy val delete: ServerEndpoint[Any, IO] =
+    served(GroupApi.delete)(user => id => groups.delete(user.id, id))
 
   /** An endpoint that invites one user to one group. */
-  lazy val invite: ServerEndpoint[Any, IO] = GroupApi
-    .invite
-    .serverSecurityLogic(auth.require)
-    .serverLogic(user =>
-      (id, request) =>
-        attempt(user)(groups.invite(user.id, id, request.username.trim)),
-    )
+  lazy val invite: ServerEndpoint[Any, IO] = served(GroupApi.invite)(user =>
+    (id, request) => groups.invite(user.id, id, request.username.trim),
+  )
 
   /** An endpoint that removes one member or pending invitee from one group. */
-  lazy val withdraw: ServerEndpoint[Any, IO] = GroupApi
-    .withdraw
-    .serverSecurityLogic(auth.require)
-    .serverLogic(user =>
-      (id, member) => attempt(user)(groups.withdraw(user.id, id, member)),
-    )
+  lazy val withdraw: ServerEndpoint[Any, IO] = served(GroupApi.withdraw)(user =>
+    (id, member) => groups.withdraw(user.id, id, member),
+  )
 
   /** An endpoint that lists the invitations sent to the signed-in user. */
-  lazy val invitations: ServerEndpoint[Any, IO] = GroupApi
-    .invitations
-    .serverSecurityLogic(auth.require)
-    .serverLogic(user => _ => attempt(user)(groups.invitations(user.id)))
+  lazy val invitations: ServerEndpoint[Any, IO] =
+    served(GroupApi.invitations)(user => _ => groups.invitations(user.id))
 
   /** An endpoint that accepts one of the signed-in user's invitations. */
-  lazy val accept: ServerEndpoint[Any, IO] = GroupApi
-    .accept
-    .serverSecurityLogic(auth.require)
-    .serverLogic(user => id => attempt(user)(groups.accept(user.id, id)))
+  lazy val accept: ServerEndpoint[Any, IO] =
+    served(GroupApi.accept)(user => id => groups.accept(user.id, id))
 
   /** An endpoint that declines one of the signed-in user's invitations. */
-  lazy val decline: ServerEndpoint[Any, IO] = GroupApi
-    .decline
-    .serverSecurityLogic(auth.require)
-    .serverLogic(user => id => attempt(user)(groups.decline(user.id, id)))
+  lazy val decline: ServerEndpoint[Any, IO] =
+    served(GroupApi.decline)(user => id => groups.decline(user.id, id))
 
   /** Every endpoint implemented by this service. */
   lazy val api: List[ServerEndpoint[Any, IO]] = List(
@@ -127,23 +104,33 @@ final class GroupService
   )
 
   /**
+    * Serves one endpoint of [[GroupApi]]: the session is resolved to a caller,
+    * the store is asked, and any failure is worded for them. Every endpoint
+    * here is this and nothing else.
+    *
+    * @param endpoint
+    *   The endpoint to serve.
+    *
+    * @param run
+    *   What the caller's request asks of the store.
+    *
+    * @return
+    *   The endpoint, with its logic.
+    */
+  private def served[I, O]
+    (endpoint: Endpoint[AuthApi.Security, I, String, O, Any])
+    (run: Caller => I => IO[O])
+    : ServerEndpoint[Any, IO] = endpoint
+    .serverSecurityLogic(auth.require)
+    .serverLogic(caller => input => attempt(caller)(run(caller)(input)))
+
+  /**
     * Runs a store action for one caller, converting any failure to an error
-    * message in their language. An [[AuthProblem]] is worded for them, as its
-    * refusal is theirs to understand. Any other failure is handed to [[report]]
-    * and answered only with the wording's fixed phrase, as a driver's message
-    * can include the failing SQL.
+    * message in their language, exactly as every other service here does. See
+    * [[Failures]].
     *
     * A host reporting its own failures can answer with the same fixed phrase,
     * as it is part of the wording.
     */
   private def attempt[X](caller: Caller)(action: IO[X]): IO[Either[String, X]] =
-    action
-      .map(Right(_))
-      .handleErrorWith(error => explain(caller, error).map(Left(_)))
-
-  /** The message shown to one caller for one failure. */
-  private def explain(caller: Caller, error: Throwable): IO[String] =
-    val words = wording(caller.locale)
-    error match
-      case problem: AuthProblem => IO.pure(words.phrase(problem.refusal))
-      case _                    => report(error).as(words.requestFailed)
+    failures.attempt(caller.locale)(action)
