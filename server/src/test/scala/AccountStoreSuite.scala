@@ -126,7 +126,7 @@ class AccountStoreSuite extends CatsEffectSuite:
           assertEquals(
             refused.left.toOption.map(_.getMessage),
             Some(
-              "You are the only owner of 1 thing. Give them to someone else, " +
+              "You're the only owner of 1 thing. Give them to someone else, " +
                 "or delete them, before deleting your account.",
             ),
           )

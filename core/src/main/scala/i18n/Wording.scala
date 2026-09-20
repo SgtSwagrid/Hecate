@@ -108,7 +108,7 @@ object Wording:
     */
   val english: Wording = new Wording:
 
-    val signedOut = "You must be signed in to do this."
+    val signedOut = "You need to sign in to do this."
 
     val usernameTaken = "That username is already taken."
 
@@ -118,33 +118,33 @@ object Wording:
 
     val incorrectRecovery = "Incorrect username or recovery code."
 
-    val noAccountDeletion = "Accounts cannot be deleted here."
+    val noAccountDeletion = "Accounts can't be deleted here."
 
-    val emptyUsername = "Username must not be empty."
+    val emptyUsername = "Username can't be empty."
 
     def passwordTooShort(min: Int) =
       s"Password must be at least $min characters."
 
-    def noSuchUser(username: String) = s"No user is named \"$username\"."
+    def noSuchUser(username: String) = s"No user is called \"$username\"."
 
-    val groupMissing = "The group does not exist."
+    val groupMissing = "That group doesn't exist."
 
-    val invitationMissing = "The invitation does not exist."
+    val invitationMissing = "That invitation doesn't exist."
 
-    val parentGroupMissing = "The parent group does not exist."
+    val parentGroupMissing = "The parent group doesn't exist."
 
-    val groupInsideItself = "A group cannot be nested inside itself."
+    val groupInsideItself = "A group can't be its own subgroup."
 
     def soleOwner(count: Int) =
       val things = if count == 1 then "1 thing" else s"$count things"
-      s"You are the only owner of $things. Give them to someone else, or " +
+      s"You're the only owner of $things. Give them to someone else, or " +
         "delete them, before deleting your account."
 
     val requestFailed = "Database request failed."
 
-    val unreadableReply = "The server sent a reply that could not be read."
+    val unreadableReply = "The server sent a reply that couldn't be read."
 
-    val unreachable = "The server could not be reached."
+    val unreachable = "The server couldn't be reached."
 
     val passwordChanged =
       "Your password has been changed, and every other session signed out."
