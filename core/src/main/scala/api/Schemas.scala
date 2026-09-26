@@ -2,10 +2,11 @@ package com.alecdorrington.hecate
 package api
 
 import com.alecdorrington.hecate.model.{
-  AuthRules, Credentials, Group, GroupDraft, GroupView, Invitation, Invite,
-  PasswordChange, PasswordCheck, Recovery, RecoveryCodes, User,
+  Access, AuthRules, Credentials, Group, GroupDraft, GroupView, Invitation,
+  Invite, InviteLink, Joinable, LinkPreview, LinkTarget, Membership,
+  PasswordChange, PasswordCheck, Recovery, RecoveryCodes, Resource, User,
 }
-import sttp.tapir.{Schema, Validator}
+import sttp.tapir.{FieldName, Schema, SchemaType, Validator}
 
 /**
   * The Tapir schema of every model type an endpoint here carries, derived once
@@ -58,6 +59,39 @@ private[api] object Schemas:
   given Schema[GroupDraft]    = Schema.derived
   given Schema[Invitation]    = Schema.derived
   given Schema[Invite]        = Schema.derived
+  given Schema[Joinable]      = Schema.derived
+  given Schema[Membership]    = Schema.derived
+
+  /** A level of access is sent as its name, e.g. `"view"`. */
+  given Schema[Access] = Schema
+    .string
+    .validate(Validator.enumeration(
+      Access.values.toList,
+      level => Some(level.name),
+    ))
+
+  given Schema[Resource]   = Schema.derived
+  given Schema[InviteLink] = Schema.derived
+
+  /**
+    * The schema of a link's target as its codec sends it: its kind, and the
+    * fields of whichever kind it is, of which only the kind is always there.
+    */
+  given Schema[LinkTarget] = Schema(
+    SchemaType.SProduct(List(SchemaType.SProductField[LinkTarget, String](
+      FieldName("kind"),
+      Schema
+        .string
+        .validate(Validator.enumeration(List(
+          LinkTarget.groupKind,
+          LinkTarget.resourceKind,
+        ))),
+      target => Some(target.kind),
+    ))),
+    Some(Schema.SName("LinkTarget")),
+  )
+
+  given Schema[LinkPreview] = Schema.derived
 
   given Schema[Credentials] = Schema
     .derived[Credentials]

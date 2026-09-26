@@ -56,12 +56,13 @@ class MyDb(...) extends Transactor
 val tables = AuthTables(H2Profile) // Or any other JDBC profile.
 val auth   = AuthService(UserStore(tables, db))
 val groups = GroupService(GroupStore(tables, db), auth)
+val links  = LinkService(LinkStore(tables), GroupStore(tables, db), GrantStore(tables, db), db, auth)
 
 // On startup, alongside your own schema creation:
 db.run(tables.createIfNotExists)
 
 // Serve them with the rest of your endpoints:
-val endpoints = auth.api ++ groups.api ++ myOwnEndpoints
+val endpoints = auth.api ++ groups.api ++ links.api ++ myOwnEndpoints
 ```
 
 `AuthTables` is parameterised on the Slick profile, so the library is not bound to any
@@ -140,8 +141,11 @@ for logs.
 
 ### Groups
 
-Groups are owned by the user who creates them, visible only to that owner, and nest to
-arbitrary depth through `Group.parent`. Membership propagates *upwards*: a member of a
+Groups are owned by the user who creates them and nest to arbitrary depth through
+`Group.parent`. Only the owner sees a group whole. Its members see it, its owner and one
+another (`GET /api/groups/mine`, a `Membership` each), but not who is invited to it or asking
+to join; anyone else sees a group only by name, and only if they are invited to it or may ask
+to join it (see *Joining a group* below). Membership propagates *upwards*: a member of a
 group is effectively a member of every group it is nested inside, so anything addressed
 to a department also reaches the members of each team within it. `GroupStore.groupIdsOf`
 returns exactly that set, and is the intended basis for "what may this user see?".
@@ -164,6 +168,61 @@ serves account deletion, where the principal is the user themselves; a user and 
 may share an identifier, so match on the kind you mean. It runs before the groups
 themselves are removed, so it may still join on them.
 
+### Joining a group
+
+Nobody joins a group without consenting, and nobody joins one without its owner's agreement
+either. Whichever side agrees first, the other completes it:
+
+- **The owner** joins their own group at once (`PUT /api/groups/{group}/membership`).
+- **An invitation**: the owner invites a user by name, and the user accepts. The group
+  reaches them in no way until then: `groupIdsOf` counts memberships alone.
+- **A request**: a user asks to join a group they can see, and the owner admits or declines
+  them. A user can see a group that is *public* (`Group.public`, set by its owner), and any
+  group nested inside one they are a member of. `GET /api/groups/joinable` lists them.
+- **An invite link**: the owner makes a link, and whoever follows it joins (see *Invite
+  links* below).
+
+Asking to join a group you are invited to accepts the invitation, and inviting someone who
+has asked admits them, since both sides have then agreed. Declining either deletes it, and
+either side may ask again; leaving a group just ends the membership.
+
+Changes to who is in, invited to or asking to join a group lock that group's row first
+(`SELECT … FOR UPDATE`), so a double-clicked invite or two tabs accepting at once cannot
+duplicate a row. The lock is skipped on SQLite, which admits one writer at a time anyway.
+
+Inviting a username that does not exist is reported as such. That discloses whether an
+account exists, and is a deliberate trade so that someone inviting a list of names knows
+which they typed wrongly.
+
+### Invite links
+
+An invite link is known by a short random code alone (`InviteCode`: five letters or digits,
+at least one a digit so that a code never spells a word, read without regard to case, and never
+chosen by anyone), so that a host can put it anywhere in
+its own URLs, as short as `https://example.com/k3x9q`. It leads either to a group, which
+following it joins, or to a resource, over which following it grants the access the link
+carries, never lowering any the follower already holds. `LinkApi` shows where a link leads
+(`GET /api/invite-links/{code}`), so that nobody follows one blind, and follows it
+(`POST /api/invite-links/{code}`).
+
+Each group and each resource has at most one link, which its owners may replace with a new
+code, ending the old one, or turn off. A group's owner manages its link through `GroupApi`.
+A resource's owners manage its link through your own endpoints, since only you know who may
+share one: compose `LinkStore.ensure`, `renew` and `remove` into a transaction that locks the
+resource's row, as for a grant. Tell `LinkService` what your resources are called, locking the
+row in the same way, so that a link never grants access to something deleted meanwhile:
+
+```scala
+LinkService(links, groups, grants, db, auth, resources = {
+  case Resource("document", id) => documents.filter(_.id === id).forUpdate.map(_.title).result.headOption
+  case _                        => DBIO.successful(None)
+})
+```
+
+`GrantStore.revokeAll`, which you already call when deleting a resource, turns its link off
+too. Codes are short enough to type, which means they can be guessed: there are some fifty
+million, so a host with many live links should limit how fast anyone may try them.
+
 ### Accounts
 
 Users can change their password, recover a forgotten one, and delete their account.
@@ -181,10 +240,13 @@ recovery never says whether the username or the code was wrong.
 
 **Deleting an account** needs the password, and removes everything that belongs to the
 user in one transaction: their sessions and recovery codes, the groups they own (with
-those groups' members, invitations and grants), their memberships and invitations
-elsewhere, the grants they hold, and whatever the host application attaches to them.
+those groups' members, invitations, requests, links and grants), their memberships,
+invitations and requests elsewhere, the invite links they made, the grants they hold, and whatever the host application attaches to them.
 It is refused while the user, with the groups they own, is the only owner of some resource,
-which would otherwise be left owned by nobody; they must first pass it on or delete it. Another
+which would otherwise be left owned by nobody; they must first pass it on or delete it. The
+host's cascade runs before that check, in the same transaction, so a resource it deletes with
+the account (one nobody else has any use for, say), grants and all, is no reason to refuse,
+and a refusal rolls the cascade back with everything else. Another
 owner means another principal holding `Own`: a group counts, even one with no members
 left in it, so this guarantees that something still owns the resource rather than that
 somebody can still open it.
@@ -233,6 +295,32 @@ Two small types carry access to the client: `Permitted` pairs a value with the a
 reader holds over it, and `Gated` marks one part of a resource as shown, absent, or
 withheld from this reader, which are never to be conflated.
 
+### Telling people what changed
+
+Every service that changes something takes an `affected` hook, which it calls once the change is
+committed with whom it concerns, so that a host with a live connection (a websocket, say) can tell
+those people to read again. It never says what changed, only whose view of it did: whoever is told
+asks again, through the endpoints that check what they may see, so telling them discloses nothing.
+
+```scala
+GroupService(groups, auth, affected = {
+  case Affected.Groups(Audience.People(ids), _) => tellEach(ids)
+  case Affected.Groups(Audience.Everyone, _)    => tellEveryone
+  case Affected.Grants(resource)                => tellWhoeverSees(resource)
+  case Affected.Account(user)                   => tellEach(Set(user))
+})
+```
+
+A change to who is in a group, invited to it or asking to join it concerns the group's owner, its
+members, who see one another, and that person; a change to the group itself (its name, nesting, visibility or existence)
+concerns everyone who saw anything of it before or sees anything of it after, and everyone at all
+when it was or is public. `Affected.Groups` also names every group whose members may have changed,
+with those enclosing them, as anything the host addressed to one of them may now reach someone else.
+Following an invite link to a resource changes the grants over it: the host alone knows who may see
+it, and `Permissions.holders` names everyone a grant over it reaches. Signing out, a new password
+or recovery codes, and a recovery concern the account's own sessions, which may be open elsewhere;
+deleting an account concerns everyone, as it leaves every group and grant it held.
+
 ### Whom a user may address
 
 `GroupStore.addressable(user)` lists the principals a user may give something to (a document,
@@ -265,6 +353,11 @@ yet, and a `None` user must not be read as "signed out". `GroupsState.forest` ne
 server's flat group list for rendering. Both states take a `Wording` for the few things they
 say themselves; everything the server refuses arrives already worded.
 
+When your server says something changed (see *Telling people what changed*), call
+`GroupsState.refresh()` to read the groups again, or `AuthState.refresh()` to read the account
+again: it signs the user out here if their session ended elsewhere, and otherwise leaves them as
+they were, recovery codes still on screen included.
+
 ## API
 
 | Method   | Path                                    | Purpose                                   |
@@ -280,29 +373,27 @@ say themselves; everything the server refuses arrives already worded.
 | `POST`   | `/api/auth/recover`                     | Regain an account with a code.            |
 | `POST`   | `/api/auth/account/delete`              | Delete your account.                      |
 | `GET`    | `/api/groups`                           | List your groups, members and invitees.   |
-| `GET`    | `/api/groups/mine`                      | List the groups you are a member of.      |
+| `GET`    | `/api/groups/mine`                      | List groups you are in, with members.     |
+| `GET`    | `/api/groups/joinable`                  | List the groups you may ask to join.      |
 | `POST`   | `/api/groups`                           | Create a group.                           |
 | `PUT`    | `/api/groups/{group}`                   | Rename or move a group.                   |
 | `DELETE` | `/api/groups/{group}`                   | Delete a group and its subgroups.         |
+| `PUT`    | `/api/groups/{group}/public`            | Make a group public, or private again.    |
+| `PUT`    | `/api/groups/{group}/invite-link`       | Give a group an invite link.              |
+| `POST`   | `/api/groups/{group}/invite-link`       | Replace a group's invite link.            |
+| `DELETE` | `/api/groups/{group}/invite-link`       | Turn off a group's invite link.           |
 | `POST`   | `/api/groups/{group}/invitations`       | Invite a user.                            |
-| `DELETE` | `/api/groups/{group}/members/{user}`    | Remove a member, or cancel an invitation. |
+| `PUT`    | `/api/groups/{group}/members/{user}`    | Admit someone who asked to join.          |
+| `DELETE` | `/api/groups/{group}/members/{user}`    | Remove a member, or cancel or decline.    |
+| `PUT`    | `/api/groups/{group}/membership`        | Join a group you own.                     |
 | `DELETE` | `/api/groups/{group}/membership`        | Leave a group yourself.                   |
+| `PUT`    | `/api/groups/{group}/request`           | Ask to join a group.                      |
+| `DELETE` | `/api/groups/{group}/request`           | Withdraw a request to join.               |
 | `GET`    | `/api/invitations`                      | List the invitations sent to you.         |
 | `POST`   | `/api/invitations/{invitation}/accept`  | Accept an invitation.                     |
 | `POST`   | `/api/invitations/{invitation}/decline` | Decline an invitation.                    |
-
-Nobody joins a group without consenting. An owner can only invite; the invited user sees
-who is asking, and becomes a member when they accept. Until then the group reaches them in
-no way: `groupIdsOf` counts memberships alone. Declining deletes the invitation, and leaving
-a group just ends the membership; either way, the owner may invite the user again.
-
-Changes to who is in or invited to a group lock that group's row first (`SELECT … FOR
-UPDATE`), so a double-clicked invite or two tabs accepting at once cannot duplicate a row.
-The lock is skipped on SQLite, which admits one writer at a time anyway.
-
-Inviting a username that does not exist is reported as such. That discloses whether an
-account exists, and is a deliberate trade so that someone inviting a list of names knows
-which they typed wrongly.
+| `GET`    | `/api/invite-links/{code}`              | See where an invite link leads.           |
+| `POST`   | `/api/invite-links/{code}`              | Follow an invite link.                    |
 
 ## 🤝 Contributing
 

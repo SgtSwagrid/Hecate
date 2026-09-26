@@ -2,7 +2,7 @@ package com.alecdorrington.hecate
 package server
 
 import com.alecdorrington.hecate.model.{
-  Access, Grant, Group, Principal, Resource, User,
+  Access, Grant, Group, LinkTarget, Principal, Resource, User,
 }
 import slick.jdbc.JdbcProfile
 import slick.jdbc.meta.MTable
@@ -77,10 +77,13 @@ final class AuthTables
     def owner  = column[Long]("owner")
     def name   = column[String]("name")
     def parent = column[Option[Long]]("parent")
+    def public = column[Boolean]("is_public")
 
     def byOwner = index(s"${ prefix }groups_owner", owner)
 
-    override def * = (id, owner, name, parent).mapTo[GroupRow]
+    def byPublic = index(s"${ prefix }groups_public", public)
+
+    override def * = (id, owner, name, parent, public).mapTo[GroupRow]
 
   /** One user's membership of one group. */
   final class Members
@@ -116,6 +119,52 @@ final class AuthTables
     def byInvitee = index(s"${ prefix }invitations_user", userId)
 
     override def * = (id, groupId, userId).mapTo[InvitationRow]
+
+  /** One user's pending request to join one group. */
+  final class Requests
+    (tag: Tag)
+    extends Table[RequestRow](tag, s"${ prefix }group_requests"):
+
+    def groupId = column[Long]("group_id")
+    def userId  = column[Long]("user_id")
+
+    def byGroup = index(
+      s"${ prefix }requests_group",
+      (groupId, userId),
+    )
+
+    def byApplicant = index(s"${ prefix }requests_user", userId)
+
+    override def * = (groupId, userId).mapTo[RequestRow]
+
+  /**
+    * One invite link, known by its code, leading either to a group or to a
+    * resource with a level of access: the one kind's columns are filled and the
+    * other's empty. At most one link exists per group and per resource,
+    * maintained by [[LinkStore]].
+    */
+  final class Links
+    (tag: Tag)
+    extends Table[LinkRow](tag, s"${ prefix }invite_links"):
+
+    def code         = column[String]("code", O.PrimaryKey)
+    def creator      = column[Long]("creator")
+    def groupId      = column[Option[Long]]("group_id")
+    def resourceKind = column[Option[String]]("resource_kind")
+    def resourceId   = column[Option[Long]]("resource_id")
+    def access       = column[Option[String]]("access")
+
+    def byGroup = index(s"${ prefix }links_group", groupId)
+
+    def byResource = index(
+      s"${ prefix }links_resource",
+      (resourceKind, resourceId),
+    )
+
+    def byCreator = index(s"${ prefix }links_creator", creator)
+
+    override def * = (code, creator, groupId, resourceKind, resourceId, access)
+      .mapTo[LinkRow]
 
   /**
     * One principal's access to one resource. Resources are named by a kind and
@@ -182,6 +231,12 @@ final class AuthTables
   /** The query for the table of group invitations. */
   val invitations = TableQuery[Invitations]
 
+  /** The query for the table of requests to join a group. */
+  val requests = TableQuery[Requests]
+
+  /** The query for the table of invite links. */
+  val links = TableQuery[Links]
+
   /** The query for the table of grants. */
   val grants = TableQuery[Grants]
 
@@ -217,6 +272,8 @@ final class AuthTables
     groups,
     members,
     invitations,
+    requests,
+    links,
     grants,
     recoveryCodes,
   )
@@ -282,6 +339,9 @@ final case class SessionRow
   * @param parent
   *   The identifier of the group this group is nested inside, or `None` for a
   *   top-level group. Always a group of the same owner.
+  *
+  * @param public
+  *   Whether everyone can find this group and ask to join it.
   */
 final case class GroupRow
   (
@@ -289,10 +349,11 @@ final case class GroupRow
     owner: Long,
     name: String,
     parent: Option[Long],
+    public: Boolean = false,
   ):
 
   /** Restores the group stored in this row. */
-  def toGroup: Group = Group(id, name, parent)
+  def toGroup: Group = Group(id, name, parent, public)
 
 /**
   * One user's membership of one group, flattened into a database row.
@@ -320,6 +381,94 @@ final case class MemberRow(groupId: Long, userId: Long)
   *   The identifier of the invited user.
   */
 final case class InvitationRow(id: Long, groupId: Long, userId: Long)
+
+/**
+  * One user's pending request to join one group, flattened into a database row.
+  * At most one exists per user per group, maintained by [[GroupStore]]. A
+  * request is deleted once admitted, declined or withdrawn.
+  *
+  * @param groupId
+  *   The identifier of the group the user asks to join.
+  *
+  * @param userId
+  *   The identifier of the user asking.
+  */
+final case class RequestRow(groupId: Long, userId: Long)
+
+/**
+  * One invite link, flattened into a database row.
+  *
+  * @param code
+  *   The code the link is known by, in lower case (see [[InviteCode]]). Kept as
+  *   it is rather than hashed, unlike a session's token, so that the owners of
+  *   what it leads to can copy the link again. They may replace it at any time.
+  *
+  * @param creator
+  *   The identifier of the user who made the link.
+  *
+  * @param groupId
+  *   The identifier of the group the link leads to, if it leads to one.
+  *
+  * @param resourceKind
+  *   The kind of the resource the link leads to, if it leads to one.
+  *
+  * @param resourceId
+  *   The identifier of that resource among those of its kind.
+  *
+  * @param access
+  *   The stored name of the level of access over that resource that following
+  *   the link grants (see [[Access.name]]).
+  */
+final case class LinkRow
+  (
+    code: String,
+    creator: Long,
+    groupId: Option[Long],
+    resourceKind: Option[String],
+    resourceId: Option[Long],
+    access: Option[String],
+  ):
+
+  /**
+    * Where this link leads, or `None` if the row names nothing this version can
+    * read, in which case the link leads nowhere, failing closed.
+    */
+  def target: Option[LinkTarget] = groupId
+    .map(LinkTarget.Joining(_))
+    .orElse(
+      for
+        kind  <- resourceKind
+        id    <- resourceId
+        level <- access.flatMap(Access.fromName)
+      yield LinkTarget.Sharing(Resource(kind, id), level),
+    )
+
+object LinkRow:
+
+  /** The row storing a link with the given code, made by the given user. */
+  def of
+    (
+      code: String,
+      creator: Long,
+      target: LinkTarget,
+    )
+    : LinkRow = target match
+    case LinkTarget.Joining(group) => LinkRow(
+        code,
+        creator,
+        Some(group),
+        None,
+        None,
+        None,
+      )
+    case LinkTarget.Sharing(resource, access) => LinkRow(
+        code,
+        creator,
+        None,
+        Some(resource.kind),
+        Some(resource.id),
+        Some(access.name),
+      )
 
 /**
   * One unused recovery code of one user, flattened into a database row. A code

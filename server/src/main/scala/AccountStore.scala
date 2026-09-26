@@ -33,8 +33,11 @@ import slick.dbio.DBIO
   * @param cascade
   *   Deletes whatever the host application attaches to the given principals:
   *   here, the one user being deleted. The same shape as the cascade given to
-  *   [[GroupStore]], which fires it for the groups the user owned. Run inside
-  *   the deletion's transaction, before the account itself is removed.
+  *   [[GroupStore]], which fires it for the groups the user owned. Run first,
+  *   inside the deletion's transaction: before the check for anything the user
+  *   alone owns, so that a resource it deletes with the account, grants and
+  *   all, is no reason to refuse, and before the user's groups and the account
+  *   itself are removed. A refusal rolls it back with the rest.
   */
 final class AccountStore
   (
@@ -62,7 +65,8 @@ final class AccountStore
     *
     * The groups a user owns are not themselves a reason to refuse. A group has
     * exactly one owner by construction, and is deleted with them, which is why
-    * their `Own` grants count for nothing here.
+    * their `Own` grants count for nothing here. Nor is anything the host's
+    * cascade removes with the account, as it runs before the check.
     *
     * The user's own row is locked first, and so is every grant written to a
     * person ([[GrantStore.grant]]), so that a grant made to the user while they
@@ -72,6 +76,7 @@ final class AccountStore
   def delete(user: Long): IO[Unit] = db.run((for
     _      <- lock(user)
     doomed <- doomedWith(user)
+    _      <- cascade(Seq(Principal.Person(user)))
     _      <- refuseOrphans(doomed)
     _      <- remove(user)
   yield ()).transactionally)
@@ -106,12 +111,13 @@ final class AccountStore
       else DBIO.failed(AuthProblem(AuthRefusal.SoleOwner(orphaned.size))),
     )
 
-  /** Removes everything that belongs to the user, and then the user. */
+  /**
+    * Removes everything else that belongs to the user, the host's cascade
+    * having run already, and then the user.
+    */
   private def remove(user: Long): DBIO[Unit] =
-    val person = Seq(Principal.Person(user))
     for
       _ <- groups.forget(user)
-      _ <- cascade(person)
-      _ <- grants.revokeHeldBy(person)
+      _ <- grants.revokeHeldBy(Seq(Principal.Person(user)))
       _ <- users.remove(user)
     yield ()

@@ -65,6 +65,19 @@ enum AuthRefusal:
     */
   case InvitationMissing
 
+  /**
+    * An owner admitted someone to a group who has not asked to join it, or who
+    * has since withdrawn their request.
+    */
+  case RequestMissing
+
+  /**
+    * An invite link was opened whose secret matches no group's: it never
+    * existed, or its owner has since replaced it or turned it off. One reason
+    * for all three, as for [[GroupMissing]].
+    */
+  case LinkMissing
+
   /** A group was to be nested inside a parent that does not exist. */
   case ParentGroupMissing
 

@@ -137,7 +137,7 @@ final class AuthState(wording: Wording = Wording.english):
   private def probe(attempt: Int): Unit = Fetch
     .get("/api/auth/me")
     .text
-    .map(response => decoded[Option[User]](response))
+    .map(signedIn)
     .recover { case _ => Some(None) }
     .foreach:
       case Some(found)                          => settle(found)
@@ -273,11 +273,30 @@ final class AuthState(wording: Wording = Wording.english):
     Fetch
       .get("/api/auth/me")
       .text
-      .map(response => decoded[Option[User]](response))
+      .map(signedIn)
       .recover { case _ => Some(None) }
       .foreach: answer =>
         rechecking = false
         answer.foreach(userVar.set)
+
+  /**
+    * Asks the server again who is signed in and how many recovery codes they
+    * have left, as when told the account changed elsewhere: a session of theirs
+    * was closed, or their password or recovery codes were replaced. A user
+    * still signed in is left as they were, so that nothing following them, such
+    * as recovery codes just generated and not yet written down, is disturbed;
+    * anyone else is adopted, as by [[recheck]].
+    */
+  def refresh(): Unit = Fetch
+    .get("/api/auth/me")
+    .text
+    .map(signedIn)
+    .recover { case _ => Some(None) }
+    .foreach:
+      case Some(found) if found.map(_.id) == userVar.now().map(_.id) =>
+        if found.isDefined then refreshCodesLeft()
+      case Some(found) => userVar.set(found)
+      case None        => ()
 
   /** Discards the last error and notice, so that a fresh form starts clean. */
   def clearError(): Unit =
@@ -318,6 +337,17 @@ final class AuthState(wording: Wording = Wording.english):
           case Replied.Answered(response) => succeeded(response)
           case Replied.Refused(problem)   => errorVar.set(Some(problem))
           case Replied.Unreachable(_) => errorVar.set(Some(wording.unreachable))
+
+  /**
+    * Who a reply to `/api/auth/me` says is signed in, or `None` when it says
+    * nothing, as when it was refused or cannot be read. Nobody signed in is an
+    * empty body, not `null`, which is how an absent value is sent, and would
+    * otherwise read as saying nothing, so that a session ended elsewhere was
+    * never noticed.
+    */
+  private def signedIn(response: FetchResponse[String]): Option[Option[User]] =
+    if response.status < 400 && response.data.isBlank then Some(None)
+    else decoded[Option[User]](response)
 
   /** Decodes a successful JSON response, or `None` when it cannot be read. */
   private def decoded[X : Decoder](response: FetchResponse[String]): Option[X] =

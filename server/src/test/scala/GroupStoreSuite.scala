@@ -546,7 +546,71 @@ class GroupStoreSuite extends CatsEffectSuite:
         mine <- groups.memberships(employee.id)
       // Only the group they actually joined: an enclosing group is not one
       // they could leave.
-      yield assertEquals(mine, List(team))
+      yield assertEquals(mine.map(_.group), List(team))
+
+  test("the members of a group see its manager and one another"):
+    withStores("fellows"): (groups, users) =>
+      for
+        owner   <- newUser(users, "manager")
+        alice   <- newUser(users, "alice")
+        bob     <- newUser(users, "bob")
+        invitee <- newUser(users, "invitee")
+        asker   <- newUser(users, "asker")
+        outside <- newUser(users, "outsider")
+        team    <- groups.create(owner.id, GroupDraft("Retail"))
+        other   <- groups.create(owner.id, GroupDraft("Chess club"))
+        _       <- groups.publish(owner.id, team.id, public = true)
+        _       <- join(groups, owner, team.id, alice)
+        _       <- join(groups, owner, team.id, bob)
+        _       <- join(groups, owner, other.id, outside)
+        _       <- groups.invite(owner.id, team.id, invitee.username)
+        _       <- groups.request(asker.id, team.id)
+        seen    <- groups.memberships(alice.id)
+        mirror  <- groups.memberships(bob.id)
+        pending <- groups.memberships(invitee.id)
+      yield
+        assertEquals(seen.map(_.group.id), List(team.id))
+        assertEquals(seen.map(_.manager), List(owner))
+        // Members only: neither the invitee nor the asker has joined, and
+        // the member of another group is none of theirs.
+        assertEquals(
+          seen.flatMap(_.members),
+          List(alice, bob),
+        )
+        assertEquals(mirror, seen)
+        assertEquals(pending, List.empty)
+
+  test("a member sees neither a subgroup's members nor an enclosing group's"):
+    withStores("fellows-nested"): (groups, users) =>
+      for
+        owner <- newUser(users, "manager")
+        upper <- newUser(users, "upper")
+        lower <- newUser(users, "lower")
+        dept  <- groups.create(owner.id, GroupDraft("Sales"))
+        team  <- groups.create(
+          owner.id,
+          GroupDraft("Retail", Some(dept.id)),
+        )
+        _     <- join(groups, owner, dept.id, upper)
+        _     <- join(groups, owner, team.id, lower)
+        above <- groups.memberships(upper.id)
+        below <- groups.memberships(lower.id)
+      yield
+        assertEquals(above.flatMap(_.members), List(upper))
+        assertEquals(below.flatMap(_.members), List(lower))
+
+  test("a member who leaves is seen by the others no longer"):
+    withStores("fellows-leave"): (groups, users) =>
+      for
+        owner <- newUser(users, "manager")
+        alice <- newUser(users, "alice")
+        bob   <- newUser(users, "bob")
+        team  <- groups.create(owner.id, GroupDraft("Retail"))
+        _     <- join(groups, owner, team.id, alice)
+        _     <- join(groups, owner, team.id, bob)
+        _     <- groups.leave(bob.id, team.id)
+        seen  <- groups.memberships(alice.id)
+      yield assertEquals(seen.flatMap(_.members), List(alice))
 
   test("leaving a group one is not in changes nothing"):
     withStores("leave-absent"): (groups, users) =>
@@ -629,7 +693,7 @@ class GroupStoreSuite extends CatsEffectSuite:
       for
         owner  <- newUser(users, "manager")
         team   <- groups.create(owner.id, GroupDraft("Retail"))
-        _      <- join(groups, owner, team.id, owner)
+        _      <- groups.join(owner.id, team.id)
         listed <- groups.addressable(owner.id)
       yield assertEquals(
         listed,

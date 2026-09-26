@@ -3,6 +3,7 @@ package server
 
 import TestDb.tables.profile.api.*
 import cats.effect.IO
+import cats.syntax.all.*
 import com.alecdorrington.hecate.model.{
   Access, Grant, GroupDraft, Principal, Resource,
 }
@@ -133,6 +134,49 @@ class AccountStoreSuite extends CatsEffectSuite:
             left.map(_.principal),
             List(Principal.Person(alice.id)),
           )
+
+  test(
+    "what the host's cascade deletes with an account is no reason to refuse",
+  ):
+    TestDb
+      .open("accounts-cascaded")
+      .use: db =>
+        val users  = UserStore(TestDb.tables, db)
+        val groups = GroupStore(TestDb.tables, db)
+        val grants = GrantStore(TestDb.tables, db)
+        // The host deletes the draft with its owner; the report outlives her.
+        val draft    = Resource("document", 1)
+        val report   = Resource("document", 2)
+        val accounts = AccountStore(
+          TestDb.tables,
+          db,
+          users,
+          groups,
+          grants,
+          _ => grants.revokeAll(draft),
+        )
+        for
+          alice <- users.register("alice", "hash").map(_.get)
+          _     <- List(draft, report).traverse(resource =>
+            db.run(grants.grant(Grant(
+              resource,
+              Principal.Person(alice.id),
+              Access.Own,
+            ))),
+          )
+          refused <- accounts.delete(alice.id).attempt
+          kept    <- grants.grantsOver(draft)
+          _       <- db.run(grants.revokeAll(report))
+          _       <- accounts.delete(alice.id)
+          gone    <- users.findById(alice.id)
+        yield
+          assert(refused.isLeft, refused)
+          // A refusal rolls back what the cascade did, too.
+          assertEquals(
+            kept.map(_.principal),
+            List(Principal.Person(alice.id)),
+          )
+          assertEquals(gone, None)
 
   test("a co-owner can delete their account, and the other owner keeps theirs"):
     TestDb

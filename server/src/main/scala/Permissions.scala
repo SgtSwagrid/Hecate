@@ -2,7 +2,7 @@ package com.alecdorrington.hecate
 package server
 
 import cats.effect.IO
-import com.alecdorrington.hecate.model.{Access, Resource}
+import com.alecdorrington.hecate.model.{Access, Principal, Resource}
 
 /**
   * Resolves what a user may do, by joining the grants over a resource with the
@@ -72,3 +72,32 @@ final class Permissions(groups: GroupStore, grants: GrantStore):
   def levels(user: Long, kind: String): IO[Map[Long, Access]] = groups
     .groupIdsOf(user)
     .flatMap(grants.levels(user, _, kind))
+
+  /**
+    * Everyone that stored access of at least the given level over one resource
+    * reaches: whoever it is granted to personally, and every member of any
+    * group it is granted to, or of a group nested inside one. The reverse of
+    * [[access]], for telling whoever holds a resource that it has changed.
+    *
+    * @param resource
+    *   The resource whose holders to find.
+    *
+    * @param least
+    *   The lowest level of access that counts.
+    *
+    * @return
+    *   A set of the identifiers of every such user, possibly empty.
+    */
+  def holders
+    (
+      resource: Resource,
+      least: Access = Access.View,
+    )
+    : IO[Set[Long]] = grants
+    .grantsOver(resource)
+    .map(_.filter(_.access.includes(least)).map(_.principal))
+    .flatMap(principals =>
+      groups
+        .membersWithin(principals.collect { case Principal.Group(id) => id })
+        .map(_.toSet ++ principals.collect { case Principal.Person(id) => id }),
+    )
