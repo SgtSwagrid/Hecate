@@ -22,7 +22,25 @@ for full stack websites built on Tapir, Slick, Cats Effect and Laminar. It is in
   rather than a fixed one, so identifiers go through the `prefix` parameter, never string literals; and it deletes
   nothing of the host's, taking instead a cascade hook run inside its own deletion transactions.
   It creates its own tables (`AuthTables.createIfNotExists`) and has no migrations.
+  Groups are joined by invitation, by a request the owner admits (only of a group the asker can see:
+  public, or nested in one they belong to), or by an invite link; `LinkStore`/`LinkService` keep one link
+  per group or resource, each a random `InviteCode` (five of a-z0-9, any case, always a digit), and a link
+  to a resource grants its level through `GrantStore.raise`, under the row lock the host's `resources` hook takes.
 - `client` (`com.alecdorrington.hecate.client`) - headless Laminar state (`AuthState`, `GroupsState`).
+
+The library tells the host whom each change it makes concerns, never what changed, through the `affected:
+Affected => IO[Unit]` hook of `GroupService`, `LinkService` and `AuthService` (default: tell nobody), once the
+change is committed, so that a host with a socket can tell them to read again. A change to who is in a group
+(or to its link) concerns its owner, its members (who see one another) and that person; a change to the group itself concerns everyone who saw
+anything of it before or after (`GroupStore.surroundings`, asked before and after), and `Audience.Everyone`
+when it was or is public; a followed link to a resource is `Affected.Grants`, whose audience the host knows;
+signing out, a new password or codes and recovery are `Affected.Account`; deleting an account concerns
+everyone. A failure to work out an audience is reported, never failing the request. `Permissions.holders` is
+the reverse of `access`: everyone a grant over a resource reaches. `AuthState.refresh` reads the account again
+without disturbing a user still signed in (`recheck` re-sets the user, which clears codes being shown).
+`/api/auth/me` answers an empty body when nobody is signed in (how `jsonBody[Option[_]]` sends `None`), which
+`AuthState.signedIn` reads as signed out; decoding it as JSON fails, and once made every recheck ignore a
+session that had ended.
 
 The library never picks a language or writes a sentence of its own. A refusal is an `AuthRefusal` value;
 `Wording` (one member per phrase, so adding one fails every implementation until it is translated) turns one

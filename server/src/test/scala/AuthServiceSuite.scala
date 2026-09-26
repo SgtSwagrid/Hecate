@@ -188,6 +188,8 @@ object AuthServiceSuite:
     override val emptyUsername: String        = "Name fehlt."
     override val groupMissing: String         = "Gruppe nicht vorhanden."
     override val invitationMissing: String    = "Einladung nicht vorhanden."
+    override val requestMissing: String       = "Anfrage nicht vorhanden."
+    override val linkMissing: String          = "Link ungültig."
     override val parentGroupMissing: String   = "Obergruppe nicht vorhanden."
     override val groupInsideItself: String    = "Gruppe in sich selbst."
     override val requestFailed: String        = "Anfrage fehlgeschlagen."

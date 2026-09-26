@@ -3,7 +3,7 @@ package client
 
 import com.alecdorrington.hecate.i18n.Wording
 import com.alecdorrington.hecate.model.{
-  Group, GroupDraft, GroupView, Invitation, Invite, User,
+  GroupDraft, GroupView, Invitation, Invite, Joinable, Membership, User,
 }
 import com.raquo.laminar.api.L.*
 import io.circe.Decoder
@@ -14,8 +14,9 @@ import scala.concurrent.ExecutionContext.Implicits.global
 /**
   * The browser-side state of the signed-in user's groups, driving the endpoints
   * of [[com.alecdorrington.hecate.api.GroupApi]]: the groups they own, the
-  * groups they belong to, and the invitations they have been sent. The server
-  * returns groups as a flat list; [[forest]] restores the nesting.
+  * groups they belong to, the invitations they have been sent, and the groups
+  * they may ask to join. The server returns groups as a flat list; [[forest]]
+  * restores the nesting.
   *
   * Every command refetches on completion, and everything refetches whenever the
   * signed-in user changes, so a sign-out empties it and a sign-in fills it. A
@@ -45,9 +46,11 @@ final class GroupsState
 
   private val groupsVar: Var[List[GroupView]] = Var(List.empty)
 
-  private val joinedVar: Var[List[Group]] = Var(List.empty)
+  private val joinedVar: Var[List[Membership]] = Var(List.empty)
 
   private val invitationsVar: Var[List[Invitation]] = Var(List.empty)
+
+  private val joinableVar: Var[List[Joinable]] = Var(List.empty)
 
   private val errorVar: Var[Option[String]] = Var(None)
 
@@ -66,18 +69,30 @@ final class GroupsState
   val forest: Signal[List[GroupTree]] = groupsVar.signal.map(GroupsState.nest)
 
   /**
-    * The groups the signed-in user is a member of but does not own. Their own
-    * groups are not repeated here.
+    * The groups the signed-in user is a member of but does not own, each with
+    * its manager and everyone in it. Their own groups are not repeated here.
     */
-  val memberships: Signal[List[Group]] = joinedVar
+  val memberships: Signal[List[Membership]] = joinedVar
     .signal
     .combineWith(groupsVar.signal)
     .mapN((mine, owned) =>
-      mine.filterNot(group => owned.exists(_.group.id == group.id)),
+      mine.filterNot(joined => owned.exists(_.group.id == joined.group.id)),
     )
 
   /** The pending invitations sent to the signed-in user. */
   val invitations: Signal[List[Invitation]] = invitationsVar.signal
+
+  /**
+    * The groups the signed-in user may ask to join, and those they have asked
+    * to join, ordered by name.
+    */
+  val joinable: Signal[List[Joinable]] = joinableVar.signal
+
+  /**
+    * How many requests to join the signed-in user's groups await their answer,
+    * across every group they own.
+    */
+  val requests: Signal[Int] = groupsVar.signal.map(_.map(_.applicants.size).sum)
 
   /** The reason the last command was refused, if any. */
   val error: Signal[Option[String]] = errorVar.signal
@@ -105,12 +120,14 @@ final class GroupsState
     groupsVar.set(List.empty)
     joinedVar.set(List.empty)
     invitationsVar.set(List.empty)
+    joinableVar.set(List.empty)
 
   /** Refetches every list, emptying those whose requests are refused. */
   def refresh(): Unit =
     fetch[GroupView]("/api/groups", groupsVar)
-    fetch[Group]("/api/groups/mine", joinedVar)
+    fetch[Membership]("/api/groups/mine", joinedVar)
     fetch[Invitation]("/api/invitations", invitationsVar)
+    fetch[Joinable]("/api/groups/joinable", joinableVar)
 
   /** Creates a group, nested under the given parent when there is one. */
   def create(name: String, parent: Option[Long] = None): Unit = command(
@@ -169,7 +186,10 @@ final class GroupsState
       .text,
   )
 
-  /** Removes one member from a group, or cancels one pending invitation. */
+  /**
+    * Removes one member from a group, cancels one pending invitation, or
+    * declines one request to join.
+    */
   def withdraw(group: Long, user: Long): Unit =
     command(Fetch.delete(s"/api/groups/$group/members/$user").text)
 
@@ -184,6 +204,47 @@ final class GroupsState
   /** Withdraws the signed-in user from a group they belong to. */
   def leave(group: Long): Unit =
     command(Fetch.delete(s"/api/groups/$group/membership").text)
+
+  /** Makes the signed-in user a member of a group they own. */
+  def join(group: Long): Unit =
+    command(Fetch.put(s"/api/groups/$group/membership").text)
+
+  /**
+    * Asks to join a group, for its owner to answer. Joins at once a group the
+    * user is invited to, or owns.
+    */
+  def request(group: Long): Unit =
+    command(Fetch.put(s"/api/groups/$group/request").text)
+
+  /** Withdraws the signed-in user's request to join a group. */
+  def retract(group: Long): Unit =
+    command(Fetch.delete(s"/api/groups/$group/request").text)
+
+  /** Admits to one of the user's groups someone who has asked to join it. */
+  def admit(group: Long, user: Long): Unit =
+    command(Fetch.put(s"/api/groups/$group/members/$user").text)
+
+  /** Makes one of the user's groups public, or private again. */
+  def publish(group: Long, public: Boolean): Unit = command(
+    Fetch
+      .put(
+        s"/api/groups/$group/public",
+        body = public,
+      )
+      .text,
+  )
+
+  /** Gives one of the user's groups an invite link, unless it has one. */
+  def link(group: Long): Unit =
+    command(Fetch.put(s"/api/groups/$group/invite-link").text)
+
+  /** Replaces one group's invite link with a new one, ending the old. */
+  def relink(group: Long): Unit =
+    command(Fetch.post(s"/api/groups/$group/invite-link").text)
+
+  /** Turns off one group's invite link. */
+  def unlink(group: Long): Unit =
+    command(Fetch.delete(s"/api/groups/$group/invite-link").text)
 
   /** Discards the last error, so that a corrected form starts clean. */
   def clearError(): Unit = errorVar.set(None)

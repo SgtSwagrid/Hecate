@@ -54,6 +54,18 @@ trait Wording:
   /** Said of an invitation that does not exist, or is somebody else's. */
   val invitationMissing: String
 
+  /**
+    * Said to a group's owner admitting someone who has not asked to join it, or
+    * who has since withdrawn their request.
+    */
+  val requestMissing: String
+
+  /**
+    * Said of an invite link that leads nowhere: it never existed, or has been
+    * replaced or turned off by the group's owner.
+    */
+  val linkMissing: String
+
   /** Said of a parent group that does not exist. */
   val parentGroupMissing: String
 
@@ -95,6 +107,8 @@ trait Wording:
     case AuthRefusal.NoSuchUser(username)  => noSuchUser(username)
     case AuthRefusal.GroupMissing          => groupMissing
     case AuthRefusal.InvitationMissing     => invitationMissing
+    case AuthRefusal.RequestMissing        => requestMissing
+    case AuthRefusal.LinkMissing           => linkMissing
     case AuthRefusal.ParentGroupMissing    => parentGroupMissing
     case AuthRefusal.GroupInsideItself     => groupInsideItself
     case AuthRefusal.SoleOwner(count)      => soleOwner(count)
@@ -133,6 +147,12 @@ object Wording:
     override val groupMissing: String = "That group doesn't exist."
 
     override val invitationMissing: String = "That invitation doesn't exist."
+
+    override val requestMissing: String =
+      "That request to join doesn't exist any more."
+
+    override val linkMissing: String =
+      "That invite link doesn't work. Ask whoever sent it for a new one."
 
     override val parentGroupMissing: String = "The parent group doesn't exist."
 

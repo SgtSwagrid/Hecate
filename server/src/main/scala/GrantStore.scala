@@ -2,7 +2,9 @@ package com.alecdorrington.hecate
 package server
 
 import cats.effect.IO
-import com.alecdorrington.hecate.model.{Access, Grant, Principal, Resource}
+import com.alecdorrington.hecate.model.{
+  Access, Grant, LinkTarget, Principal, Resource,
+}
 import slick.dbio.DBIO
 
 /**
@@ -64,6 +66,29 @@ final class GrantStore(tables: AuthTables, db: Transactor):
     .transactionally
 
   /**
+    * Grants one principal at least the given access over one resource, keeping
+    * any higher access they already hold over it themselves, so that accepting
+    * a lesser offer never costs anybody anything. Locks as [[grant]] does, and
+    * needs the caller to lock the resource as [[grant]] does.
+    *
+    * @param granted
+    *   The grant to hold at least from now on.
+    *
+    * @return
+    *   An action storing the grant, unless as much is held already.
+    */
+  def raise(granted: Grant): DBIO[Unit] = lockPerson(granted.principal)
+    .flatMap(_ =>
+      held(granted.resource, granted.principal).map(_.access).result,
+    )
+    .flatMap(levels =>
+      if GrantStore.highest(levels).exists(_.includes(granted.access)) then
+        DBIO.successful(())
+      else grant(granted),
+    )
+    .transactionally
+
+  /**
     * Locks the row of the person granted to, if the principal is a person, so
     * that a grant and the deletion of that person's account take turns rather
     * than leaving a grant that outlives the account.
@@ -90,12 +115,13 @@ final class GrantStore(tables: AuthTables, db: Transactor):
     held(resource, principal).delete.unit
 
   /**
-    * Withdraws every grant over one resource. No foreign key will ever remove a
-    * grant naming a resource that no longer exists, so a host application must
-    * compose this into the transaction deleting the resource itself. Opens no
-    * transaction of its own. The caller must lock the resource's row before
-    * calling this, not merely when deleting the row itself, or a grant being
-    * written concurrently can commit after it.
+    * Withdraws every grant over one resource, and turns off its invite link, so
+    * that no link can grant access to it afterwards. No foreign key will ever
+    * remove a grant naming a resource that no longer exists, so a host
+    * application must compose this into the transaction deleting the resource
+    * itself. Opens no transaction of its own. The caller must lock the
+    * resource's row before calling this, not merely when deleting the row
+    * itself, or a grant being written concurrently can commit after it.
     *
     * @param resource
     *   The resource being deleted.
@@ -103,7 +129,12 @@ final class GrantStore(tables: AuthTables, db: Transactor):
     * @return
     *   An action withdrawing every grant over the resource.
     */
-  def revokeAll(resource: Resource): DBIO[Unit] = over(resource).delete.unit
+  def revokeAll(resource: Resource): DBIO[Unit] = over(resource)
+    .delete
+    .flatMap(_ => links.remove(LinkTarget.Sharing(resource, Access.View)))
+
+  /** The links to resources, which go with the resources' grants. */
+  private val links = LinkStore(tables)
 
   /**
     * Withdraws every grant held by any of the given principals, over any

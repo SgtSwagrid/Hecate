@@ -50,6 +50,13 @@ import sttp.tapir.server.ServerEndpoint
   *   The wording refusals are written in, chosen by the language a request asks
   *   for, or `None` when it asks for none. Defaults to the library's English
   *   for every request.
+  *
+  * @param affected
+  *   Told, once each change is committed, whom it concerns: see [[Affected]].
+  *   Signing out, a new password or recovery codes and a recovery concern the
+  *   account's own sessions, which may be open elsewhere; deleting an account
+  *   concerns everyone, as it leaves every group and grant it was in. Defaults
+  *   to telling nobody.
   */
 final class AuthService
   (
@@ -58,6 +65,7 @@ final class AuthService
     accounts: Option[AccountStore] = None,
     report: Throwable => IO[Unit] = error => Console[IO].printStackTrace(error),
     wording: Option[String] => Wording = _ => Wording.english,
+    affected: Affected => IO[Unit] = _ => IO.unit,
   ):
 
   private val failures = Failures(wording, report)
@@ -79,7 +87,15 @@ final class AuthService
   /** An endpoint that signs the current user out. */
   lazy val logout: ServerEndpoint[Any, IO] = AuthApi
     .logout
-    .serverLogic(token => failures.caught(None)(signOut(token)))
+    .serverLogic(token =>
+      failures.caught(None)(
+        token
+          .flatTraverse(users.sessionUser)
+          .flatMap(user =>
+            signOut(token).flatTap(_ => told(user.map(_.id), account)),
+          ),
+      ),
+    )
 
   /** An endpoint that identifies the signed-in user, if any. */
   lazy val me: ServerEndpoint[Any, IO] = AuthApi
@@ -101,7 +117,14 @@ final class AuthService
     .changePassword
     .serverSecurityLogic(require)
     .serverLogic(caller =>
-      change => failures.caught(caller.locale)(changePasswordOf(caller, change)),
+      change =>
+        failures.caught(caller.locale)(changePasswordOf(caller, change).flatTap(
+          changed =>
+            told(
+              changed.toOption.as(caller.id),
+              account,
+            ),
+        )),
     )
 
   /** An endpoint that issues the signed-in user a fresh set of recovery codes. */
@@ -111,7 +134,9 @@ final class AuthService
     .serverLogic(caller =>
       check =>
         failures.caught(caller.locale)(
-          confirmed(caller, check.password)(issueCodes(caller.user)),
+          confirmed(caller, check.password)(issueCodes(caller.user)).flatTap(
+            issued => told(issued.toOption.as(caller.id), account),
+          ),
         ),
     )
 
@@ -127,7 +152,13 @@ final class AuthService
   lazy val recover: ServerEndpoint[Any, IO] = AuthApi
     .recover
     .serverLogic((recovery, locale) =>
-      failures.caught(locale)(recoverAccount(recovery, locale)),
+      failures.caught(locale)(recoverAccount(recovery, locale).flatTap(
+        regained =>
+          told(
+            regained.toOption.map(_._1.id),
+            account,
+          ),
+      )),
     )
 
   /**
@@ -140,7 +171,14 @@ final class AuthService
     .serverSecurityLogic(require)
     .serverLogic(caller =>
       check =>
-        failures.caught(caller.locale)(removeAccount(caller, check.password)),
+        failures.caught(caller.locale)(
+          removeAccount(caller, check.password).flatTap(removed =>
+            told(
+              removed.toOption.as(caller.id),
+              deleted,
+            ),
+          ),
+        ),
     )
 
   /** Every endpoint implemented by this service. */
@@ -168,6 +206,34 @@ final class AuthService
         .flatTraverse(users.sessionUser)
         .map(_.map(Caller(_, locale)).toRight(wording(locale).signedOut)),
     )
+
+  /**
+    * Tells the host whom a change to the given user's account concerns, where
+    * there was a change. It is made already, so a failure to tell is reported
+    * rather than failing the request.
+    */
+  private def told
+    (
+      user: Option[Long],
+      concerned: Long => List[Affected],
+    )
+    : IO[Unit] = user
+    .toList
+    .flatMap(concerned)
+    .traverse_(affected)
+    .handleErrorWith(report)
+
+  /** Whom a change to one account concerns: its own sessions. */
+  private def account(user: Long): List[Affected] = List(Affected.Account(user))
+
+  /**
+    * Whom deleting one account concerns: its own sessions, and everyone, as it
+    * leaves every group it owned or was in and every grant it held.
+    */
+  private def deleted(user: Long): List[Affected] = List(
+    Affected.Account(user),
+    Affected.Groups(Audience.Everyone, Set.empty),
+  )
 
   /** The wording one caller's refusals are written in. */
   private def words(caller: Caller): Wording = wording(caller.locale)
