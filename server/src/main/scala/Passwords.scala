@@ -19,10 +19,12 @@ import javax.crypto.spec.PBEKeySpec
 object Passwords:
 
   /**
-    * The PBKDF2 iteration count applied to newly hashed passwords where a host
-    * application names none, following OWASP's guidance for PBKDF2-HMAC-SHA256.
-    * Every hash stores the count it was derived under, so this may be raised
-    * whenever the guidance moves without stranding a single stored password.
+    * The PBKDF2 iteration count [[AuthPolicy]] applies where a host application
+    * names none, following OWASP's guidance for PBKDF2-HMAC-SHA256. Every hash
+    * stores the count it was derived under, so this may be raised whenever the
+    * guidance moves without stranding a single stored password. Nothing here
+    * falls back on it: every operation is told its count, so that the host's
+    * own is never overridden.
     */
   val iterations = 600000
 
@@ -46,14 +48,22 @@ object Passwords:
   /**
     * A well-formed hash that no password matches, for checking against when
     * there is no stored hash to check. Verifying against it costs a full
-    * derivation, so an unknown username takes as long to refuse as a wrong
-    * password and cannot be told apart by timing.
+    * derivation under the given count, so an unknown username takes as long to
+    * refuse as a wrong password, and cannot be told apart by timing, provided
+    * the count is the one real passwords are hashed under.
     *
     * Its salt and hash must both stay non-empty: [[verify]] rejects a hash with
     * an empty field immediately, which would defeat the whole point.
+    *
+    * @param rounds
+    *   The iteration count real passwords are hashed under.
+    *
+    * @return
+    *   A hash in the stored form, under a fresh salt, that no password matches.
     */
-  val decoy: String = s"$iterations:${ encode(randomBytes(saltBytes)) }:" +
-    encode(randomBytes(keyBits / 8))
+  def decoy(rounds: Int): String =
+    s"$rounds:${ encode(randomBytes(saltBytes)) }:" +
+      encode(randomBytes(keyBits / 8))
 
   /**
     * Hashes a password under a fresh random salt.
@@ -68,10 +78,9 @@ object Passwords:
     * @return
     *   A hash in the stored form, of the given password under a fresh salt.
     */
-  def hash(password: String, rounds: Int = iterations): IO[String] = IO
-    .blocking:
-      val salt = randomBytes(saltBytes)
-      s"$rounds:${ encode(salt) }:${ encode(derive(password, salt, rounds)) }"
+  def hash(password: String, rounds: Int): IO[String] = IO.blocking:
+    val salt = randomBytes(saltBytes)
+    s"$rounds:${ encode(salt) }:${ encode(derive(password, salt, rounds)) }"
 
   /**
     * Whether the password matches a stored hash. Hashes are compared in
@@ -98,13 +107,14 @@ object Passwords:
     *   The stored hash.
     *
     * @param rounds
-    *   The iteration count a password would be hashed under today.
+    *   The iteration count a password would be hashed under today, as the host
+    *   application's policy sets it.
     *
     * @return
     *   Whether the stored hash is weaker than a fresh one would be. A hash too
     *   malformed to say is left alone: [[verify]] refuses it anyway.
     */
-  def outdated(stored: String, rounds: Int = iterations): Boolean = stored
+  def outdated(stored: String, rounds: Int): Boolean = stored
     .split(':')
     .headOption
     .flatMap(_.toIntOption)

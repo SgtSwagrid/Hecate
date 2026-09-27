@@ -82,15 +82,14 @@ final class AccountStore
   yield ()).transactionally)
 
   /**
-    * Locks the user's row until the transaction ends, so that a grant written
-    * to them takes its turn with their deletion rather than outliving it.
+    * Locks the user's row until the transaction ends, where the database can,
+    * so that a grant written to them takes its turn with their deletion rather
+    * than outliving it.
     */
   private def lock(user: Long): DBIO[Unit] = tables
-    .users
-    .filter(_.id === user)
-    .forUpdate
+    .locked(tables.users.filter(_.id === user))
     .result
-    .map(_ => ())
+    .unit
 
   /** The principals this deletion removes: the user, and the groups they own. */
   private def doomedWith(user: Long): DBIO[Seq[Principal]] = tables
@@ -107,8 +106,10 @@ final class AccountStore
   private def refuseOrphans(doomed: Seq[Principal]): DBIO[Unit] = grants
     .soleOwnerOf(doomed)
     .flatMap(orphaned =>
-      if orphaned.isEmpty then DBIO.successful(())
-      else DBIO.failed(AuthProblem(AuthRefusal.SoleOwner(orphaned.size))),
+      refuseUnless(
+        orphaned.isEmpty,
+        AuthRefusal.SoleOwner(orphaned.size),
+      ),
     )
 
   /**

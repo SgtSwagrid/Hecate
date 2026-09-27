@@ -4,7 +4,7 @@ package server
 import com.alecdorrington.hecate.model.{
   Access, Grant, Group, LinkTarget, Principal, Resource, User,
 }
-import slick.jdbc.JdbcProfile
+import slick.jdbc.{JdbcCapabilities, JdbcProfile}
 import slick.jdbc.meta.MTable
 
 /**
@@ -242,6 +242,22 @@ final class AuthTables
 
   /** The query for the table of unused recovery codes. */
   val recoveryCodes = TableQuery[Codes]
+
+  /** Whether the database can lock the rows a query reads. */
+  private val canLock = profile
+    .capabilities
+    .contains(JdbcCapabilities.forUpdate)
+
+  /**
+    * The given query, locking the rows it reads until the transaction ends,
+    * where the database can. Every row lock the stores take goes through here,
+    * never through `forUpdate` itself: a profile without the capability still
+    * writes `FOR UPDATE` when asked, and SQLite, the one such database Slick
+    * supports, then refuses the whole statement. It lets only one writer in at
+    * a time anyway, so skipping the lock there loses nothing.
+    */
+  private[server] def locked[E, U](query: Query[E, U, Seq]): Query[E, U, Seq] =
+    if canLock then query.forUpdate else query
 
   /**
     * Creates any of this library's tables that the database does not already

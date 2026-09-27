@@ -1,5 +1,6 @@
 package com.alecdorrington.hecate
 
+import com.alecdorrington.hecate.model.AuthRefusal
 import scala.concurrent.ExecutionContext
 import slick.dbio.DBIO
 
@@ -36,6 +37,21 @@ package object server:
     (none: => Y)
     (some: Seq[X] => DBIO[Y])
     : DBIO[Y] = if values.isEmpty then DBIO.successful(none) else some(values)
+
+  /** The found value, or a failed transaction refusing for the given reason. */
+  private[server] def required[X]
+    (found: Option[X], problem: AuthRefusal)
+    : DBIO[X] =
+    found.fold[DBIO[X]](DBIO.failed(AuthProblem(problem)))(DBIO.successful)
+
+  /**
+    * An action doing nothing if the check holds, or else a failed transaction
+    * refusing for the given reason.
+    */
+  private[server] def refuseUnless
+    (holds: Boolean, problem: AuthRefusal)
+    : DBIO[Unit] =
+    if holds then DBIO.successful(()) else DBIO.failed(AuthProblem(problem))
 
   extension [X](action: DBIO[X])
 

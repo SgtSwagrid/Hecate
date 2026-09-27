@@ -70,6 +70,13 @@ final class AuthService
 
   private val failures = Failures(wording, report)
 
+  /**
+    * What a password is checked against when there is no account to check it
+    * against, derived under the policy's count, so that refusing an unknown
+    * username costs what refusing a wrong password does.
+    */
+  private val decoy = Passwords.decoy(policy.hashingRounds)
+
   /** An endpoint that registers a new account and signs it in. */
   lazy val register: ServerEndpoint[Any, IO] = AuthApi
     .register
@@ -88,13 +95,9 @@ final class AuthService
   lazy val logout: ServerEndpoint[Any, IO] = AuthApi
     .logout
     .serverLogic(token =>
-      failures.caught(None)(
-        token
-          .flatTraverse(users.sessionUser)
-          .flatMap(user =>
-            signOut(token).flatTap(_ => told(user.map(_.id), account)),
-          ),
-      ),
+      failures.caught(None)(current(token).flatMap(user =>
+        signOut(token).flatTap(_ => told(user.map(_.id), account)),
+      )),
     )
 
   /** An endpoint that identifies the signed-in user, if any. */
@@ -201,11 +204,9 @@ final class AuthService
     */
   def require(security: AuthApi.Security): IO[Either[String, Caller]] =
     val (token, locale) = security
-    failures.caught(locale)(
-      token
-        .flatTraverse(users.sessionUser)
-        .map(_.map(Caller(_, locale)).toRight(wording(locale).signedOut)),
-    )
+    failures.caught(locale)(current(token).map(
+      _.map(Caller(_, locale)).toRight(wording(locale).signedOut),
+    ))
 
   /**
     * Tells the host whom a change to the given user's account concerns, where
@@ -247,11 +248,7 @@ final class AuthService
     : IO[Either[String, (User, CookieValueWithMeta)]] =
     policy.reject(credentials) match
       case Some(problem) => IO.pure(Left(wording(locale).phrase(problem)))
-      case None          => Passwords
-          .hash(
-            credentials.password,
-            policy.hashingRounds,
-          )
+      case None          => hashed(credentials.password)
           .flatMap(users.register(credentials.username.trim, _))
           .flatMap:
             case None       => IO.pure(Left(wording(locale).usernameTaken))
@@ -259,8 +256,8 @@ final class AuthService
 
   /**
     * Checks the credentials against the stored hash, then opens a session. An
-    * unknown username is checked against [[Passwords.decoy]], so that the reply
-    * takes as long either way and cannot be used to enumerate accounts.
+    * unknown username is checked against the [[decoy]], so that the reply takes
+    * as long either way and cannot be used to enumerate accounts.
     */
   private def signIn
     (
@@ -296,10 +293,7 @@ final class AuthService
       case Some(problem) => IO.pure(Left(words(caller).phrase(problem)))
       case None          => confirmed(caller, change.current):
           for
-            hash <- Passwords.hash(
-              change.replacement,
-              policy.hashingRounds,
-            )
+            hash    <- hashed(change.replacement)
             token   <- AuthService.freshToken
             expires <- expiry
             _       <- users.resetPassword(caller.id, hash, token, expires)
@@ -340,10 +334,7 @@ final class AuthService
       case Some(problem) => IO.pure(Left(wording(locale).phrase(problem)))
       case None          =>
         for
-          hash <- Passwords.hash(
-            recovery.replacement,
-            policy.hashingRounds,
-          )
+          hash    <- hashed(recovery.replacement)
           token   <- AuthService.freshToken
           expires <- expiry
           found   <- users.recover(
@@ -373,28 +364,33 @@ final class AuthService
 
   /**
     * The found account, provided the password matches its hash. An absent
-    * account is checked against [[Passwords.decoy]], so that the reply takes as
-    * long either way and cannot be used to enumerate accounts.
+    * account is checked against the [[decoy]], so that the reply takes as long
+    * either way and cannot be used to enumerate accounts.
     */
   private def verified
     (found: Option[UserRow], password: String)
     : IO[Option[UserRow]] = Passwords
     .verify(
       password,
-      found.fold(Passwords.decoy)(_.passwordHash),
+      found.fold(decoy)(_.passwordHash),
     )
     .map(matches => found.filter(_ => matches))
     .flatTap(_.traverse_(rehashed(_, password)))
 
   /**
-    * Stores a password again, under the iteration count applied now, where it
-    * was stored under fewer. A cost raised in a later version then reaches the
-    * accounts that never change their password, on the one occasion their
-    * password is known: the moment they prove it.
+    * Stores a password again, under the policy's iteration count, where it was
+    * stored under fewer. A cost raised later, by the host or by a new default,
+    * then reaches the accounts that never change their password, on the one
+    * occasion their password is known: the moment they prove it. A password
+    * stored under more is left as it is.
     */
   private def rehashed(row: UserRow, password: String): IO[Unit] =
-    IO.whenA(Passwords.outdated(row.passwordHash)):
-      Passwords.hash(password).flatMap(users.rehash(row.id, _))
+    IO.whenA(Passwords.outdated(row.passwordHash, policy.hashingRounds)):
+      hashed(password).flatMap(users.rehash(row.id, _))
+
+  /** Hashes a password under the policy's iteration count. */
+  private def hashed(password: String): IO[String] =
+    Passwords.hash(password, policy.hashingRounds)
 
   /** Opens a fresh session for the given user, yielding its cookie. */
   private def openSession(user: User): IO[(User, CookieValueWithMeta)] =
@@ -444,10 +440,13 @@ object AuthService:
   *   The fewest characters a password may have.
   *
   * @param hashingRounds
-  *   How many PBKDF2 iterations a newly hashed password is derived under.
-  *   Defaults to [[Passwords.iterations]]. Raise it on hardware that can afford
-  *   it, and never lower it below what a password already stored was hashed
-  *   under, which each hash carries with it.
+  *   How many PBKDF2 iterations a password is derived under: a new one at once,
+  *   and one stored under fewer the next time its owner gives it, which is
+  *   derived again. An unknown username is checked against a decoy derived
+  *   under as many, so that it takes as long to refuse. Defaults to
+  *   [[Passwords.iterations]]. Raise it on hardware that can afford it. Each
+  *   hash carries the count it was derived under, and one stored under more is
+  *   left as it is, so lowering it weakens only the passwords stored after.
   */
 final case class AuthPolicy
   (

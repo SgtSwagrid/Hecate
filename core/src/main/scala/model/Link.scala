@@ -85,7 +85,7 @@ object LinkTarget:
   * without regard to case, and never chosen by anyone. It is the whole of what
   * a link needs, so that a link is short enough to read out or copy by hand. At
   * least one of its characters is a digit, so that a code can never spell a
-  * word, and a host can put codes beside paths of its own, such as `/tasks`,
+  * word, and a host can put codes beside paths of its own, such as `/about`,
   * without either ever being taken for the other.
   */
 object InviteCode:

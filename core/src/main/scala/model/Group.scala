@@ -6,8 +6,8 @@ import io.circe.Codec
 /**
   * One user group: a named collection of users, owned by the user who created
   * it. Groups may be nested inside other groups to arbitrary depth, so that a
-  * group can stand for a whole hierarchy (e.g. a year containing classes
-  * containing study groups).
+  * group can stand for a whole hierarchy (e.g. a department containing teams
+  * containing working groups).
   *
   * @param id
   *   The unique, stable identifier of this group, assigned by the store.

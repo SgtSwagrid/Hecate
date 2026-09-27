@@ -6,7 +6,6 @@ import cats.effect.std.Console
 import com.alecdorrington.hecate.api.{AuthApi, GroupApi}
 import com.alecdorrington.hecate.i18n.Wording
 import com.alecdorrington.hecate.model.Caller
-import sttp.tapir.Endpoint
 import sttp.tapir.server.ServerEndpoint
 
 /**
@@ -59,28 +58,24 @@ final class GroupService
     served(GroupApi.mine)(user => _ => groups.memberships(user.id))
 
   /** An endpoint that withdraws the signed-in user from one group. */
-  lazy val leave: ServerEndpoint[Any, IO] = served(GroupApi.leave)(user =>
-    id => joining(Seq(id), user.id)(groups.leave(user.id, id)),
-  )
+  lazy val leave: ServerEndpoint[Any, IO] =
+    servedJoining(GroupApi.leave)(groups.leave)
 
   /** An endpoint that makes the signed-in user a member of a group they own. */
-  lazy val join: ServerEndpoint[Any, IO] = served(GroupApi.join)(user =>
-    id => joining(Seq(id), user.id)(groups.join(user.id, id)),
-  )
+  lazy val join: ServerEndpoint[Any, IO] =
+    servedJoining(GroupApi.join)(groups.join)
 
   /** An endpoint that lists the groups the signed-in user may ask to join. */
   lazy val joinable: ServerEndpoint[Any, IO] =
     served(GroupApi.joinable)(user => _ => groups.joinable(user.id))
 
   /** An endpoint that asks to join one group. */
-  lazy val request: ServerEndpoint[Any, IO] = served(GroupApi.request)(user =>
-    id => joining(Seq(id), user.id)(groups.request(user.id, id)),
-  )
+  lazy val request: ServerEndpoint[Any, IO] =
+    servedJoining(GroupApi.request)(groups.request)
 
   /** An endpoint that withdraws a request to join one group. */
-  lazy val retract: ServerEndpoint[Any, IO] = served(GroupApi.retract)(user =>
-    id => joining(Seq(id), user.id)(groups.retract(user.id, id)),
-  )
+  lazy val retract: ServerEndpoint[Any, IO] =
+    servedJoining(GroupApi.retract)(groups.retract)
 
   /** An endpoint that makes one group public or private. */
   lazy val publish: ServerEndpoint[Any, IO] = served(GroupApi.publish)(user =>
@@ -91,19 +86,16 @@ final class GroupService
   )
 
   /** An endpoint that gives one group an invite link unless it has one. */
-  lazy val link: ServerEndpoint[Any, IO] = served(GroupApi.link)(user =>
-    id => joining(Seq(id), user.id)(groups.link(user.id, id)),
-  )
+  lazy val link: ServerEndpoint[Any, IO] =
+    servedJoining(GroupApi.link)(groups.link)
 
   /** An endpoint that replaces one group's invite link with a new one. */
-  lazy val relink: ServerEndpoint[Any, IO] = served(GroupApi.relink)(user =>
-    id => joining(Seq(id), user.id)(groups.relink(user.id, id)),
-  )
+  lazy val relink: ServerEndpoint[Any, IO] =
+    servedJoining(GroupApi.relink)(groups.relink)
 
   /** An endpoint that turns off one group's invite link. */
-  lazy val unlink: ServerEndpoint[Any, IO] = served(GroupApi.unlink)(user =>
-    id => joining(Seq(id), user.id)(groups.unlink(user.id, id)),
-  )
+  lazy val unlink: ServerEndpoint[Any, IO] =
+    servedJoining(GroupApi.unlink)(groups.unlink)
 
   /** An endpoint that stores a new group for the signed-in user. */
   lazy val create: ServerEndpoint[Any, IO] = served(GroupApi.create)(user =>
@@ -206,12 +198,7 @@ final class GroupService
   /** Whom a change to who is in the given groups concerns. */
   private def joined(changed: Seq[Long], person: Long): IO[Affected] = groups
     .surroundings(changed)
-    .map(around =>
-      Affected.Groups(
-        Audience.People(around.owners ++ around.members + person),
-        around.enclosing,
-      ),
-    )
+    .map(_.joined(person))
 
   /**
     * Runs a change to groups themselves: their names, nesting, visibility or
@@ -272,19 +259,30 @@ final class GroupService
     *   The endpoint, with its logic.
     */
   private def served[I, O]
-    (endpoint: Endpoint[AuthApi.Security, I, String, O, Any])
+    (endpoint: AuthApi.Secured[I, O])
     (run: Caller => I => IO[O])
     : ServerEndpoint[Any, IO] = endpoint
     .serverSecurityLogic(auth.require)
-    .serverLogic(caller => input => attempt(caller)(run(caller)(input)))
+    .serverLogic(caller =>
+      input => failures.attempt(caller.locale)(run(caller)(input)),
+    )
 
   /**
-    * Runs a store action for one caller, converting any failure to an error
-    * message in their language, exactly as every other service here does. See
-    * [[Failures]].
+    * Serves one endpoint of [[GroupApi]] that changes one group on the caller's
+    * own behalf, run as [[joining]] runs a change about the caller.
     *
-    * A host reporting its own failures can answer with the same fixed phrase,
-    * as it is part of the wording.
+    * @param endpoint
+    *   The endpoint to serve, whose input is the group.
+    *
+    * @param change
+    *   The change to make, given the identifiers of the caller and the group.
+    *
+    * @return
+    *   The endpoint, with its logic.
     */
-  private def attempt[X](caller: Caller)(action: IO[X]): IO[Either[String, X]] =
-    failures.attempt(caller.locale)(action)
+  private def servedJoining[O]
+    (endpoint: AuthApi.Secured[Long, O])
+    (change: (Long, Long) => IO[O])
+    : ServerEndpoint[Any, IO] = served(endpoint)(user =>
+    id => joining(Seq(id), user.id)(change(user.id, id)),
+  )

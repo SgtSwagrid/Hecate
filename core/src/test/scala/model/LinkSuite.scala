@@ -29,8 +29,8 @@ class LinkSuite extends FunSuite:
       "k3-9q",
       "k3x9é",
       "",
-      "tasks/",
-      "tasks",
+      "about/",
+      "about",
       "Books",
     ).foreach(text => assertEquals(InviteCode.parse(text), None, text))
 

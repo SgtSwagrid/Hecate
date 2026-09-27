@@ -1,19 +1,16 @@
 package com.alecdorrington.hecate
 package server
 
+import Fixtures.{enrol, serve, SendRequest}
 import cats.effect.{IO, Ref}
 import com.alecdorrington.hecate.api.AuthApi
 import com.alecdorrington.hecate.model.{
-  Access, Credentials, GroupDraft, LinkTarget, PasswordChange, Resource, User,
+  Access, GroupDraft, LinkTarget, PasswordChange, Resource, User,
 }
-import io.circe.parser.decode
 import io.circe.syntax.*
 import munit.CatsEffectSuite
 import slick.dbio.DBIO
-import sttp.client3.{basicRequest, Response, UriContext}
-import sttp.client3.impl.cats.CatsMonadAsyncError
-import sttp.client3.testing.SttpBackendStub
-import sttp.tapir.server.stub.TapirStubInterpreter
+import sttp.client3.{basicRequest, UriContext}
 
 /**
   * Tests of whom the services say each change concerns, through their
@@ -207,7 +204,6 @@ object AffectedSuite:
       told: Ref[IO, List[Affected]],
     ):
 
-    val users  = UserStore(TestDb.tables, db)
     val groups = GroupStore(TestDb.tables, db)
     val links  = LinkStore(TestDb.tables)
 
@@ -215,31 +211,14 @@ object AffectedSuite:
     def reported: IO[List[Affected]] = told.getAndSet(Nil).map(_.reverse)
 
     /** Registers a user, yielding them and their session cookie. */
-    def signUp(name: String): IO[(User, String)] = send(
-      basicRequest
-        .post(uri"http://test/api/auth/register")
-        .body(Credentials(name, "hunter2222").asJson.noSpaces),
-    ).map(answer =>
-      (
-        answer
-          .body
-          .flatMap(decode[User](_).left.map(_.getMessage))
-          .toOption
-          .get,
-        answer.unsafeCookies.find(_.name == AuthApi.sessionCookie).get.value,
-      ),
-    )
+    def signUp(name: String): IO[(User, String)] = Fixtures.signUp(send, name)
 
     /**
       * Invites a user to a group, straight through the store, and has them
       * accept.
       */
     def join(owner: User, group: Long, member: User): IO[Unit] =
-      for
-        _     <- groups.invite(owner.id, group, member.username)
-        found <- groups.invitations(member.id)
-        _     <- groups.accept(member.id, found.head.id)
-      yield ()
+      enrol(groups, owner, group, member)
 
     /** Follows a link as the user with the given session. */
     def follow(cookie: String, code: String): IO[Unit] = send(
@@ -319,19 +298,9 @@ object AffectedSuite:
           resource => DBIO.successful(Option.when(resource == book)("Dune")),
           affected = tell,
         )
-        backend = TapirStubInterpreter(
-          SttpBackendStub[IO, Any](CatsMonadAsyncError[IO]()),
-        ).whenServerEndpointsRunLogic(auth.api ++ service.api ++ links.api)
-          .backend()
         _ <- check(World(
           db,
-          request => request.send(backend),
+          serve(auth.api ++ service.api ++ links.api),
           told,
         ))
       yield ()
-
-  /** Sends one request to the endpoints under test. */
-  private type SendRequest =
-    sttp.client3.Request[Either[String, String], Any] => IO[
-      Response[Either[String, String]],
-    ]

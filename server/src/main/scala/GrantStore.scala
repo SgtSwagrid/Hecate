@@ -89,13 +89,13 @@ final class GrantStore(tables: AuthTables, db: Transactor):
     .transactionally
 
   /**
-    * Locks the row of the person granted to, if the principal is a person, so
-    * that a grant and the deletion of that person's account take turns rather
-    * than leaving a grant that outlives the account.
+    * Locks the row of the person granted to, if the principal is a person and
+    * the database can, so that a grant and the deletion of that person's
+    * account take turns rather than leaving a grant that outlives the account.
     */
   private def lockPerson(principal: Principal): DBIO[Unit] = principal match
     case Principal.Person(id) =>
-      tables.users.filter(_.id === id).forUpdate.result.unit
+      tables.locked(tables.users.filter(_.id === id)).result.unit
     case Principal.Group(_) => DBIO.successful(())
 
   /**
@@ -197,9 +197,8 @@ final class GrantStore(tables: AuthTables, db: Transactor):
     * Lists every readable grant over one resource, for showing who holds access
     * to it and for checking directly what was stored.
     */
-  def grantsOver(resource: Resource): IO[List[Grant]] = db
-    .run(over(resource).result)
-    .map(_.toList.flatMap(_.toGrant))
+  def grantsOver(resource: Resource): IO[List[Grant]] =
+    db.run(granted(resource))
 
   /**
     * As [[grantsOver]], but composing into the caller's transaction, so that a

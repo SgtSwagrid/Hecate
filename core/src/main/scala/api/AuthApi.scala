@@ -82,16 +82,18 @@ object AuthApi:
   /** The language cookie, as an input of an endpoint that is not secured. */
   private def language = cookie[Option[String]](languageCookie)
 
+  /** The base of every endpoint here, secured or not: refused with a sentence. */
+  private val base: Open[Unit, Unit] = endpoint.errorOut(stringBody)
+
   /**
     * The base of every endpoint that requires a signed-in user, in this library
     * and in the host application alike. Its security logic resolves the session
     * cookie to a [[com.alecdorrington.hecate.model.Caller]], or explains why it
     * cannot, in the language the language cookie asks for.
     */
-  val secured: Secured[Unit, Unit] = endpoint
+  val secured: Secured[Unit, Unit] = base
     .securityIn(cookie[Option[String]](sessionCookie))
     .securityIn(language)
-    .errorOut(stringBody)
 
   /**
     * An endpoint that registers a new account and signs it in, setting the
@@ -101,14 +103,13 @@ object AuthApi:
     : Open[
       (Credentials, Option[String]),
       (User, CookieValueWithMeta),
-    ] = endpoint
+    ] = base
     .post
     .in("api" / "auth" / "register")
     .in(jsonBody[Credentials])
     .in(language)
     .out(jsonBody[User])
     .out(setCookie(sessionCookie))
-    .errorOut(stringBody)
 
   /**
     * An endpoint that signs into an existing account, setting the session
@@ -118,43 +119,39 @@ object AuthApi:
     : Open[
       (Credentials, Option[String]),
       (User, CookieValueWithMeta),
-    ] = endpoint
+    ] = base
     .post
     .in("api" / "auth" / "login")
     .in(jsonBody[Credentials])
     .in(language)
     .out(jsonBody[User])
     .out(setCookie(sessionCookie))
-    .errorOut(stringBody)
 
   /**
     * An endpoint that signs the current user out, closing their session and
     * clearing the session cookie.
     */
-  val logout: Open[Option[String], CookieValueWithMeta] = endpoint
+  val logout: Open[Option[String], CookieValueWithMeta] = base
     .post
     .in("api" / "auth" / "logout")
     .in(cookie[Option[String]](sessionCookie))
     .out(setCookie(sessionCookie))
-    .errorOut(stringBody)
 
   /** An endpoint that identifies the signed-in user, if any. */
-  val me: Open[Option[String], Option[User]] = endpoint
+  val me: Open[Option[String], Option[User]] = base
     .get
     .in("api" / "auth" / "me")
     .in(cookie[Option[String]](sessionCookie))
     .out(jsonBody[Option[User]])
-    .errorOut(stringBody)
 
   /**
     * An endpoint that describes the rules for accounts, so that a client can
     * state them before a request is refused.
     */
-  val rules: Open[Unit, AuthRules] = endpoint
+  val rules: Open[Unit, AuthRules] = base
     .get
     .in("api" / "auth" / "rules")
     .out(jsonBody[AuthRules])
-    .errorOut(stringBody)
 
   /**
     * An endpoint that changes the signed-in user's password, given their
@@ -193,14 +190,13 @@ object AuthApi:
     : Open[
       (Recovery, Option[String]),
       (User, CookieValueWithMeta),
-    ] = endpoint
+    ] = base
     .post
     .in("api" / "auth" / "recover")
     .in(jsonBody[Recovery])
     .in(language)
     .out(jsonBody[User])
     .out(setCookie(sessionCookie))
-    .errorOut(stringBody)
 
   /**
     * An endpoint that deletes the signed-in user's account and everything that

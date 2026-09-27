@@ -35,7 +35,7 @@ final class LinkStore(tables: AuthTables):
     * asks the database about no groups.
     */
   def toGroups(groups: Seq[Long]): DBIO[Map[Long, String]] = ifAny(groups)(
-    Map.empty[Long, String],
+    Map.empty,
   ): shown =>
     tables
       .links

@@ -22,6 +22,10 @@ for full stack websites built on Tapir, Slick, Cats Effect and Laminar. It is in
   rather than a fixed one, so identifiers go through the `prefix` parameter, never string literals; and it deletes
   nothing of the host's, taking instead a cascade hook run inside its own deletion transactions.
   It creates its own tables (`AuthTables.createIfNotExists`) and has no migrations.
+  Every row lock goes through `AuthTables.locked`, never `.forUpdate` itself: Slick's SQLite profile
+  lacks the capability yet still writes `FOR UPDATE`, which SQLite refuses. `Passwords` is told every
+  iteration count (`AuthPolicy.hashingRounds`, for new hashes, rehashing and the decoy alike), and
+  `Passwords.iterations` is only the policy's default, so that the host's count is never overridden.
   Groups are joined by invitation, by a request the owner admits (only of a group the asker can see:
   public, or nested in one they belong to), or by an invite link; `LinkStore`/`LinkService` keep one link
   per group or resource, each a random `InviteCode` (five of a-z0-9, any case, always a digit), and a link

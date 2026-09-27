@@ -71,7 +71,7 @@ final class UserStore(tables: AuthTables, db: Transactor):
 
   /** Finds one stored user by identifier, including their password hash. */
   def findById(user: Long): IO[Option[UserRow]] =
-    db.run(tables.users.filter(_.id === user).result.headOption)
+    db.run(byId(user).result.headOption)
 
   /**
     * Opens a sign-in session for the given user under the given token, expiring
@@ -210,13 +210,7 @@ final class UserStore(tables: AuthTables, db: Transactor):
     * nobody need be signed out.
     */
   private[server] def rehash(user: Long, passwordHash: String): IO[Unit] = db
-    .run(
-      tables
-        .users
-        .filter(_.id === user)
-        .map(_.passwordHash)
-        .update(passwordHash),
-    )
+    .run(byId(user).map(_.passwordHash).update(passwordHash))
     .void
 
   /**
@@ -224,9 +218,9 @@ final class UserStore(tables: AuthTables, db: Transactor):
     * account's deletion, which removes everything else of theirs first.
     */
   private[server] def remove(user: Long): DBIO[Unit] = DBIO.seq(
-    tables.sessions.filter(_.userId === user).delete,
+    sessionsOf(user).delete,
     codesOf(user).delete,
-    tables.users.filter(_.id === user).delete,
+    byId(user).delete,
   )
 
   /** Sets a password, closing every session and opening the given one. */
@@ -238,15 +232,21 @@ final class UserStore(tables: AuthTables, db: Transactor):
       expires: Long,
     )
     : DBIO[Unit] = DBIO.seq(
-    tables.users.filter(_.id === user).map(_.passwordHash).update(passwordHash),
-    tables.sessions.filter(_.userId === user).delete,
+    byId(user).map(_.passwordHash).update(passwordHash),
+    sessionsOf(user).delete,
     tables.sessions += SessionRow(Digest.of(token), user, expires),
   )
+
+  /** The query for the stored user with the given identifier. */
+  private def byId(user: Long) = tables.users.filter(_.id === user)
 
   /** The query for the stored user with the given username. */
   private def byUsername(username: String) = tables
     .users
     .filter(_.username === username)
+
+  /** The query for every session of the given user. */
+  private def sessionsOf(user: Long) = tables.sessions.filter(_.userId === user)
 
   /** The query for every unused recovery code of the given user. */
   private def codesOf(user: Long) = tables

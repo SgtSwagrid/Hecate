@@ -1,12 +1,11 @@
 package com.alecdorrington.hecate
 package server
 
+import Fixtures.{enrol, give, newUser}
 import TestDb.tables.profile.api.*
 import cats.effect.IO
 import cats.syntax.all.*
-import com.alecdorrington.hecate.model.{
-  Access, Grant, GroupDraft, Principal, Resource,
-}
+import com.alecdorrington.hecate.model.{Access, GroupDraft, Principal, Resource}
 import munit.CatsEffectSuite
 
 class AccountStoreSuite extends CatsEffectSuite:
@@ -35,32 +34,30 @@ class AccountStoreSuite extends CatsEffectSuite:
         )
         val document = Resource("document", 1)
         for
-          alice  <- users.register("alice", "hash").map(_.get)
-          bob    <- users.register("bob", "hash").map(_.get)
-          _      <- users.openSession("alice-token", alice.id, soon)
-          _      <- users.replaceRecoveryCodes(alice.id, List("one", "two"))
-          hers   <- groups.create(alice.id, GroupDraft("Alice's team"))
-          his    <- groups.create(bob.id, GroupDraft("Bob's team"))
-          _      <- groups.invite(bob.id, his.id, "alice")
-          invite <- groups.invitations(alice.id).map(_.head)
-          _      <- groups.accept(alice.id, invite.id)
-          _      <- groups.invite(alice.id, hers.id, "bob")
+          alice <- newUser(users, "alice")
+          bob   <- newUser(users, "bob")
+          _     <- users.openSession("alice-token", alice.id, soon)
+          _     <- users.replaceRecoveryCodes(alice.id, List("one", "two"))
+          hers  <- groups.create(alice.id, GroupDraft("Alice's team"))
+          his   <- groups.create(bob.id, GroupDraft("Bob's team"))
+          _     <- enrol(groups, bob, his.id, alice)
+          _     <- groups.invite(alice.id, hers.id, "bob")
           // Edit rather than Own, as the only owner of something is refused.
-          _ <- db.run(grants.grant(Grant(
+          _ <- give(grants, db)(
             document,
             Principal.Person(alice.id),
             Access.Edit,
-          )))
-          _ <- db.run(grants.grant(Grant(
+          )
+          _ <- give(grants, db)(
             document,
             Principal.Group(hers.id),
             Access.View,
-          )))
-          _ <- db.run(grants.grant(Grant(
+          )
+          _ <- give(grants, db)(
             document,
             Principal.Person(bob.id),
             Access.View,
-          )))
+          )
           _        <- accounts.delete(alice.id)
           gone     <- users.findById(alice.id)
           session  <- users.sessionUser("alice-token")
@@ -106,14 +103,14 @@ class AccountStoreSuite extends CatsEffectSuite:
         )
         val document = Resource("document", 1)
         for
-          alice <- users.register("alice", "hash").map(_.get)
+          alice <- newUser(users, "alice")
           hers  <- groups.create(alice.id, GroupDraft("Alice's team"))
           _     <- users.openSession("alice-token", alice.id, soon)
-          _     <- db.run(grants.grant(Grant(
+          _     <- give(grants, db)(
             document,
             Principal.Person(alice.id),
             Access.Own,
-          )))
+          )
           refused <- accounts.delete(alice.id).attempt
           still   <- users.findById(alice.id)
           session <- users.sessionUser("alice-token")
@@ -156,14 +153,12 @@ class AccountStoreSuite extends CatsEffectSuite:
           _ => grants.revokeAll(draft),
         )
         for
-          alice <- users.register("alice", "hash").map(_.get)
-          _     <- List(draft, report).traverse(resource =>
-            db.run(grants.grant(Grant(
-              resource,
-              Principal.Person(alice.id),
-              Access.Own,
-            ))),
-          )
+          alice <- newUser(users, "alice")
+          _     <- List(draft, report).traverse(give(grants, db)(
+            _,
+            Principal.Person(alice.id),
+            Access.Own,
+          ))
           refused <- accounts.delete(alice.id).attempt
           kept    <- grants.grantsOver(draft)
           _       <- db.run(grants.revokeAll(report))
@@ -195,18 +190,18 @@ class AccountStoreSuite extends CatsEffectSuite:
         )
         val document = Resource("document", 1)
         for
-          alice <- users.register("alice", "hash").map(_.get)
-          bob   <- users.register("bob", "hash").map(_.get)
-          _     <- db.run(grants.grant(Grant(
+          alice <- newUser(users, "alice")
+          bob   <- newUser(users, "bob")
+          _     <- give(grants, db)(
             document,
             Principal.Person(alice.id),
             Access.Own,
-          )))
-          _ <- db.run(grants.grant(Grant(
+          )
+          _ <- give(grants, db)(
             document,
             Principal.Person(bob.id),
             Access.Own,
-          )))
+          )
           _    <- accounts.delete(alice.id)
           gone <- users.findById(alice.id)
           left <- grants.grantsOver(document)
@@ -233,8 +228,8 @@ class AccountStoreSuite extends CatsEffectSuite:
           _ => DBIO.successful(()),
         )
         for
-          alice <- users.register("alice", "hash").map(_.get)
-          bob   <- users.register("bob", "hash").map(_.get)
+          alice <- newUser(users, "alice")
+          bob   <- newUser(users, "bob")
           _     <- users.openSession("bob-token", bob.id, soon)
           his   <- groups.create(bob.id, GroupDraft("Bob's team"))
           _     <- accounts.delete(alice.id)

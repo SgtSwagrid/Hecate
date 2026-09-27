@@ -1,6 +1,7 @@
 package com.alecdorrington.hecate
 package server
 
+import Fixtures.{enrol, newUser, refusal}
 import cats.effect.IO
 import com.alecdorrington.hecate.i18n.Wording
 import com.alecdorrington.hecate.model.{
@@ -29,29 +30,6 @@ class JoiningSuite extends CatsEffectSuite:
       ),
     )
 
-  /** Registers a user for tests. */
-  private def newUser(users: UserStore, name: String): IO[User] = users
-    .register(name, "hash")
-    .map(_.get)
-
-  /** Invites a user to a group, and has them accept. */
-  private def enrol
-    (
-      groups: GroupStore,
-      owner: User,
-      group: Long,
-      member: User,
-    )
-    : IO[Unit] =
-    for
-      _    <- groups.invite(owner.id, group, member.username)
-      sent <- groups.invitations(member.id)
-      _    <- groups.accept(
-        member.id,
-        sent.find(_.group.id == group).get.id,
-      )
-    yield ()
-
   /** The identifiers of the direct members of one of the owner's groups. */
   private def membersOf
     (
@@ -62,11 +40,6 @@ class JoiningSuite extends CatsEffectSuite:
     : IO[List[Long]] = groups
     .owned(owner.id)
     .map(_.find(_.group.id == group).toList.flatMap(_.members.map(_.id)))
-
-  /** The message a failed action was refused with. */
-  private def refusal(action: IO[?]): IO[Option[String]] = action
-    .attempt
-    .map(_.left.toOption.map(_.getMessage))
 
   private val english = Wording.english
 
