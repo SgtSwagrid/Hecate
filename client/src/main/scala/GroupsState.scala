@@ -154,24 +154,18 @@ final class GroupsState
       refused: String => Unit = _ => (),
     )
     : Unit = command(
-    Fetch
-      .put(
-        s"/api/groups/${ group.group.id }",
-        body = GroupDraft(name, group.group.parent),
-      )
-      .text,
+    save(
+      group.group.id,
+      GroupDraft(name, group.group.parent),
+    ),
     refused,
   )
 
   /** Moves one group under the given parent, or to the top level. */
-  def move(group: GroupView, parent: Option[Long]): Unit = command(
-    Fetch
-      .put(
-        s"/api/groups/${ group.group.id }",
-        body = GroupDraft(group.group.name, parent),
-      )
-      .text,
-  )
+  def move(group: GroupView, parent: Option[Long]): Unit = command(save(
+    group.group.id,
+    GroupDraft(group.group.name, parent),
+  ))
 
   /** Deletes one group, together with every group nested beneath it. */
   def delete(id: Long): Unit = command(Fetch.delete(s"/api/groups/$id").text)
@@ -248,6 +242,13 @@ final class GroupsState
 
   /** Discards the last error, so that a corrected form starts clean. */
   def clearError(): Unit = errorVar.set(None)
+
+  /** A request that stores one group's name and place in the hierarchy. */
+  private def save
+    (id: Long, draft: GroupDraft)
+    : EventStream[FetchResponse[String]] = Fetch
+    .put(s"/api/groups/$id", body = draft)
+    .text
 
   /** Replaces one list with what an endpoint returns, or with nothing. */
   private def fetch[X : Decoder](url: String, into: Var[List[X]]): Unit =

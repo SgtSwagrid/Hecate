@@ -72,7 +72,11 @@ rather than anything a request carries.
 
 The stores expect `READ COMMITTED` or stricter, and use `SELECT … FOR UPDATE` where the
 profile has it, to serialise the changes that no table constraint can (see *Groups* below).
-On SQLite, which has neither, one writer at a time makes the locks unnecessary.
+On SQLite, which has neither, one writer at a time makes the locks unnecessary, so the
+library leaves them out. Slick's SQLite profile still writes the clause when a query asks
+for it, and SQLite refuses the statement, so a host on SQLite should check its profile's
+`capabilities` for `JdbcCapabilities.forUpdate` before locking its own rows (the
+`resources` example under *Invite links* assumes a database that has it).
 
 ### Securing your own endpoints
 
@@ -115,8 +119,11 @@ AuthService(users, AuthPolicy(sessionSeconds = 3600, minPasswordLength = 12))
 ```
 
 Passwords are derived with PBKDF2-HMAC-SHA256 at `AuthPolicy.hashingRounds` iterations,
-which defaults to OWASP's current figure. Each stored hash carries the count it was
-derived under, so raising it later leaves every stored password verifiable.
+which defaults to OWASP's current figure, and the decoy is derived at the same count, so
+that timing still says nothing. Each stored hash carries the count it was derived under,
+so raising it later leaves every stored password verifiable, and a password stored under
+fewer is derived again at your count the next time its owner signs in. One stored under
+more is left as it is.
 
 ### Speaking the user's language
 

@@ -1,18 +1,15 @@
 package com.alecdorrington.hecate
 package server
 
+import Fixtures.{read, register, serve, SendRequest}
 import cats.effect.IO
 import com.alecdorrington.hecate.api.AuthApi
 import com.alecdorrington.hecate.i18n.Wording
 import com.alecdorrington.hecate.model.{Credentials, User}
-import io.circe.parser.decode
 import io.circe.syntax.*
 import munit.CatsEffectSuite
 import sttp.client3.{basicRequest, Response, UriContext}
-import sttp.client3.impl.cats.CatsMonadAsyncError
-import sttp.client3.testing.SttpBackendStub
 import sttp.model.StatusCode
-import sttp.tapir.server.stub.TapirStubInterpreter
 
 /**
   * Tests of the endpoints [[AuthService]] serves, as a caller meets them: what
@@ -26,8 +23,8 @@ class AuthServiceSuite extends CatsEffectSuite:
     served(): call =>
       for
         registered <- call(register("alice", "hunter2222"))
-        user = registered.body.flatMap(decode[User](_).left.map(_.getMessage))
-        signed <- call(basicRequest.get(uri"http://test/api/auth/me"))
+        user = read[User](registered)
+        signed <- call(me)
       yield
         assertEquals(user.map(_.username), Right("alice"))
         assert(
@@ -38,25 +35,16 @@ class AuthServiceSuite extends CatsEffectSuite:
 
   test("nobody is signed in without the cookie"):
     served(): call =>
-      call(
-        basicRequest.get(uri"http://test/api/auth/me"),
-      ).map(answer => assertEquals(answer.body, Right(nobody)))
+      call(me).map(answer => assertEquals(answer.body, Right(nobody)))
 
   test("a session cookie signs its owner in"):
     served(): call =>
       for
         opened <- call(register("alice", "hunter2222"))
         token = cookieOf(opened).get
-        found <- call(
-          basicRequest
-            .get(uri"http://test/api/auth/me")
-            .cookie(AuthApi.sessionCookie, token),
-        )
+        found <- call(me.cookie(AuthApi.sessionCookie, token))
       yield assertEquals(
-        found
-          .body
-          .flatMap(decode[Option[User]](_).left.map(_.getMessage))
-          .map(_.map(_.username)),
+        read[Option[User]](found).map(_.map(_.username)),
         Right(Some("alice")),
       )
 
@@ -108,6 +96,29 @@ class AuthServiceSuite extends CatsEffectSuite:
           "a correct sign-in opened nothing",
         )
 
+  /**
+    * A password stored under fewer rounds than the policy asks for is derived
+    * again under the policy's count when its owner signs in, and one stored
+    * under as many is left alone: never under the library's own default, which
+    * would override the host's choice either way.
+    */
+  test("signing in derives a password again under the policy's rounds alone"):
+    TestDb
+      .users(s"auth-rehash-${ java.util.UUID.randomUUID }")
+      .use: users =>
+        val rounds = users
+          .findByUsername("alice")
+          .map(_.map(_.passwordHash.takeWhile(_ != ':')))
+        for
+          _      <- hashingAt(users, 1000)(register("alice", "hunter2222"))
+          _      <- hashingAt(users, 1000)(login("alice", "hunter2222"))
+          kept   <- rounds
+          _      <- hashingAt(users, 2000)(login("alice", "hunter2222"))
+          raised <- rounds
+        yield
+          assertEquals(kept, Some("1000"))
+          assertEquals(raised, Some("2000"))
+
   test("an unknown username is refused exactly as a wrong password is"):
     served(): call =>
       for
@@ -126,11 +137,7 @@ class AuthServiceSuite extends CatsEffectSuite:
             .post(uri"http://test/api/auth/logout")
             .cookie(AuthApi.sessionCookie, token),
         )
-        after <- call(
-          basicRequest
-            .get(uri"http://test/api/auth/me")
-            .cookie(AuthApi.sessionCookie, token),
-        )
+        after <- call(me.cookie(AuthApi.sessionCookie, token))
       yield assertEquals(after.body, Right(nobody))
 
   test("an endpoint that needs a user refuses when there is none"):
@@ -206,15 +213,13 @@ object AuthServiceSuite:
     override def soleOwner(count: Int): String =
       s"Alleiniger Eigentümer von $count Dingen."
 
-  /** A request registering one account. */
-  private def register(username: String, password: String) = basicRequest
-    .post(uri"http://test/api/auth/register")
-    .body(Credentials(username, password).asJson.noSpaces)
-
   /** A request signing into one account. */
   private def login(username: String, password: String) = basicRequest
     .post(uri"http://test/api/auth/login")
     .body(Credentials(username, password).asJson.noSpaces)
+
+  /** A request asking who is signed in. */
+  private val me = basicRequest.get(uri"http://test/api/auth/me")
 
   /**
     * What the body of a reply naming nobody looks like. Tapir sends an absent
@@ -228,6 +233,17 @@ object AuthServiceSuite:
     .find(_.name == AuthApi.sessionCookie)
     .map(_.value)
     .filter(_.nonEmpty)
+
+  /**
+    * Serves the endpoints of a service over the given store, deriving passwords
+    * under the given number of rounds.
+    */
+  private def hashingAt(users: UserStore, rounds: Int): SendRequest = serve(
+    AuthService(
+      users,
+      AuthPolicy(hashingRounds = rounds),
+    ).api,
+  )
 
   /**
     * Runs a check against the endpoints of a service over a fresh database,
@@ -244,15 +260,4 @@ object AuthServiceSuite:
     (check: SendRequest => IO[Unit])
     : IO[Unit] = TestDb
     .users(s"auth-service-${ java.util.UUID.randomUUID }")
-    .use: users =>
-      val backend = TapirStubInterpreter(
-        SttpBackendStub[IO, Any](CatsMonadAsyncError[IO]()),
-      ).whenServerEndpointsRunLogic(AuthService(users, wording = wording).api)
-        .backend()
-      check(request => request.send(backend))
-
-  /** Sends one request to the endpoints under test. */
-  private type SendRequest =
-    sttp.client3.Request[Either[String, String], Any] => IO[
-      Response[Either[String, String]],
-    ]
+    .use(users => check(serve(AuthService(users, wording = wording).api)))

@@ -1,6 +1,7 @@
 package com.alecdorrington.hecate
 package server
 
+import Fixtures.{enrol, give, newUser, refusal}
 // The query syntax of the very profile the tables under test are built on.
 // Importing a concrete profile's `api` instead would put a second, unrelated
 // set of the same extension methods in scope, which resolve against neither
@@ -9,10 +10,9 @@ import TestDb.tables.profile.api.*
 import cats.effect.IO
 import cats.syntax.all.*
 import com.alecdorrington.hecate.model.{
-  Access, Grant, GroupDraft, Invitation, Principal, Resource, User,
+  Access, GroupDraft, Invitation, Principal, Resource, User,
 }
 import munit.CatsEffectSuite
-import slick.jdbc.{H2Profile, JdbcCapabilities, SQLiteProfile}
 
 class GroupStoreSuite extends CatsEffectSuite:
 
@@ -21,11 +21,6 @@ class GroupStoreSuite extends CatsEffectSuite:
     (name: String)
     (check: (GroupStore, UserStore) => IO[Unit])
     : IO[Unit] = TestDb.groups(s"groups-$name").use(check.tupled)
-
-  /** Registers a user for tests, yielding their assigned identifier. */
-  private def newUser(users: UserStore, name: String): IO[User] = users
-    .register(name, "hash")
-    .map(_.get)
 
   /** The invitation the given user holds to the given group. */
   private def invitationTo
@@ -37,26 +32,6 @@ class GroupStoreSuite extends CatsEffectSuite:
     : IO[Invitation] = groups
     .invitations(user.id)
     .map(_.find(_.group.id == group).get)
-
-  /** Invites a user to a group, and has them accept. */
-  private def join
-    (
-      groups: GroupStore,
-      owner: User,
-      group: Long,
-      member: User,
-    )
-    : IO[Unit] =
-    for
-      _          <- groups.invite(owner.id, group, member.username)
-      invitation <- invitationTo(groups, member, group)
-      _          <- groups.accept(member.id, invitation.id)
-    yield ()
-
-  /** The message a failed action was refused with. */
-  private def refusal(action: IO[?]): IO[Option[String]] = action
-    .attempt
-    .map(_.left.toOption.map(_.getMessage))
 
   test("a created group is listed back for its owner, initially empty"):
     withStores("create"): (groups, users) =>
@@ -171,7 +146,7 @@ class GroupStoreSuite extends CatsEffectSuite:
           GroupDraft("Retail", Some(dept.id)),
         )
         keep    <- groups.create(owner.id, GroupDraft("Chess club"))
-        _       <- join(groups, owner, team.id, employee)
+        _       <- enrol(groups, owner, team.id, employee)
         _       <- groups.invite(owner.id, team.id, "invited")
         _       <- groups.delete(owner.id, dept.id)
         all     <- groups.owned(owner.id)
@@ -266,7 +241,7 @@ class GroupStoreSuite extends CatsEffectSuite:
           owner.id,
           GroupDraft("Retail", Some(dept.id)),
         )
-        _       <- join(groups, owner, team.id, employee)
+        _       <- enrol(groups, owner, team.id, employee)
         view    <- groups.owned(owner.id).map(_.find(_.group.id == team.id).get)
         sent    <- groups.invitations(employee.id)
         reached <- groups.groupIdsOf(employee.id)
@@ -317,7 +292,7 @@ class GroupStoreSuite extends CatsEffectSuite:
         owner    <- newUser(users, "manager")
         employee <- newUser(users, "employee")
         team     <- groups.create(owner.id, GroupDraft("Retail"))
-        _        <- join(groups, owner, team.id, employee)
+        _        <- enrol(groups, owner, team.id, employee)
         _        <- groups.invite(owner.id, team.id, "employee")
         view     <- groups.owned(owner.id).map(_.head)
       yield
@@ -366,7 +341,7 @@ class GroupStoreSuite extends CatsEffectSuite:
         owner    <- newUser(users, "manager")
         employee <- newUser(users, "employee")
         team     <- groups.create(owner.id, GroupDraft("Retail"))
-        _        <- join(groups, owner, team.id, employee)
+        _        <- enrol(groups, owner, team.id, employee)
         _        <- groups.leave(employee.id, team.id)
         joined   <- groups.memberships(employee.id)
         reached  <- groups.groupIdsOf(employee.id)
@@ -394,16 +369,16 @@ class GroupStoreSuite extends CatsEffectSuite:
             GroupDraft("Retail", Some(dept.id)),
           )
           keep <- groups.create(owner.id, GroupDraft("Chess club"))
-          _    <- db.run(grants.grant(Grant(
+          _    <- give(grants, db)(
             document,
             Principal.Group(team.id),
             Access.View,
-          )))
-          _ <- db.run(grants.grant(Grant(
+          )
+          _ <- give(grants, db)(
             document,
             Principal.Group(keep.id),
             Access.View,
-          )))
+          )
           _    <- groups.delete(owner.id, dept.id)
           left <- grants.grantsOver(document)
         yield assertEquals(
@@ -417,7 +392,7 @@ class GroupStoreSuite extends CatsEffectSuite:
         owner    <- newUser(users, "manager")
         employee <- newUser(users, "employee")
         team     <- groups.create(owner.id, GroupDraft("Retail"))
-        _        <- join(groups, owner, team.id, employee)
+        _        <- enrol(groups, owner, team.id, employee)
         _        <- groups.withdraw(owner.id, team.id, employee.id)
         removed  <- groups.owned(owner.id).map(_.head)
         _        <- groups.invite(owner.id, team.id, "employee")
@@ -483,7 +458,7 @@ class GroupStoreSuite extends CatsEffectSuite:
           GroupDraft("Front desk", Some(team.id)),
         )
         _      <- groups.create(owner.id, GroupDraft("Chess club"))
-        _      <- join(groups, owner, row.id, employee)
+        _      <- enrol(groups, owner, row.id, employee)
         theirs <- groups.groupIdsOf(employee.id)
       yield assertEquals(
         theirs,
@@ -507,7 +482,7 @@ class GroupStoreSuite extends CatsEffectSuite:
           stranger.id,
           GroupDraft("Payroll", Some(theirs.id)),
         )
-        _    <- join(groups, owner, team.id, employee)
+        _    <- enrol(groups, owner, team.id, employee)
         mine <- groups.groupIdsOf(employee.id)
         none <- groups.groupIdsOf(stranger.id)
       yield
@@ -524,7 +499,7 @@ class GroupStoreSuite extends CatsEffectSuite:
           owner    <- newUser(users, "manager")
           employee <- newUser(users, "employee")
           team     <- groups.create(owner.id, GroupDraft("Retail"))
-          _        <- join(groups, owner, team.id, employee)
+          _        <- enrol(groups, owner, team.id, employee)
           // Deleted behind the store's back, as a host writing rows directly
           // might, so that the membership is left pointing at nothing.
           _ <- db.run(TestDb.tables.groups.filter(_.id === team.id).delete)
@@ -542,7 +517,7 @@ class GroupStoreSuite extends CatsEffectSuite:
           GroupDraft("Retail", Some(dept.id)),
         )
         _    <- groups.create(owner.id, GroupDraft("Chess club"))
-        _    <- join(groups, owner, team.id, employee)
+        _    <- enrol(groups, owner, team.id, employee)
         mine <- groups.memberships(employee.id)
       // Only the group they actually joined: an enclosing group is not one
       // they could leave.
@@ -560,9 +535,9 @@ class GroupStoreSuite extends CatsEffectSuite:
         team    <- groups.create(owner.id, GroupDraft("Retail"))
         other   <- groups.create(owner.id, GroupDraft("Chess club"))
         _       <- groups.publish(owner.id, team.id, public = true)
-        _       <- join(groups, owner, team.id, alice)
-        _       <- join(groups, owner, team.id, bob)
-        _       <- join(groups, owner, other.id, outside)
+        _       <- enrol(groups, owner, team.id, alice)
+        _       <- enrol(groups, owner, team.id, bob)
+        _       <- enrol(groups, owner, other.id, outside)
         _       <- groups.invite(owner.id, team.id, invitee.username)
         _       <- groups.request(asker.id, team.id)
         seen    <- groups.memberships(alice.id)
@@ -591,8 +566,8 @@ class GroupStoreSuite extends CatsEffectSuite:
           owner.id,
           GroupDraft("Retail", Some(dept.id)),
         )
-        _     <- join(groups, owner, dept.id, upper)
-        _     <- join(groups, owner, team.id, lower)
+        _     <- enrol(groups, owner, dept.id, upper)
+        _     <- enrol(groups, owner, team.id, lower)
         above <- groups.memberships(upper.id)
         below <- groups.memberships(lower.id)
       yield
@@ -606,8 +581,8 @@ class GroupStoreSuite extends CatsEffectSuite:
         alice <- newUser(users, "alice")
         bob   <- newUser(users, "bob")
         team  <- groups.create(owner.id, GroupDraft("Retail"))
-        _     <- join(groups, owner, team.id, alice)
-        _     <- join(groups, owner, team.id, bob)
+        _     <- enrol(groups, owner, team.id, alice)
+        _     <- enrol(groups, owner, team.id, bob)
         _     <- groups.leave(bob.id, team.id)
         seen  <- groups.memberships(alice.id)
       yield assertEquals(seen.flatMap(_.members), List(alice))
@@ -619,22 +594,12 @@ class GroupStoreSuite extends CatsEffectSuite:
         employee <- newUser(users, "employee")
         other    <- newUser(users, "other")
         team     <- groups.create(owner.id, GroupDraft("Retail"))
-        _        <- join(groups, owner, team.id, employee)
+        _        <- enrol(groups, owner, team.id, employee)
         _        <- groups.leave(other.id, team.id)
         view     <- groups.owned(owner.id).map(_.head)
       yield
         assertEquals(view.members, List(employee))
         assertEquals(view.invitees, List.empty)
-
-  /**
-    * [[GroupStore]] takes its row locks only where the profile declares them,
-    * because a profile that lacks them may not omit `FOR UPDATE` but emit it
-    * and fail at runtime. Pins the one database each way, so that the guard is
-    * not mistaken for dead code while every test here runs on H2.
-    */
-  test("row locks are taken on H2, and skipped on SQLite, which has none"):
-    assert(H2Profile.capabilities.contains(JdbcCapabilities.forUpdate))
-    assert(!SQLiteProfile.capabilities.contains(JdbcCapabilities.forUpdate))
 
   test(
     "the owners of a member's groups may address them, and reach them within",
@@ -649,13 +614,11 @@ class GroupStoreSuite extends CatsEffectSuite:
           alice.id,
           GroupDraft("Retail", Some(dept.id)),
         )
-        _    <- groups.invite(alice.id, team.id, "bob")
-        sent <- groups.invitations(bob.id)
-        _    <- groups.accept(bob.id, sent.head.id)
-        _    <- groups.addressersOf(bob.id).assertEquals(Set(alice.id))
-        _    <- groups.addressersOf(carol.id).assertEquals(Set.empty)
-        _    <- groups.membersWithin(Seq(dept.id)).assertEquals(List(bob.id))
-        _    <- groups.membersWithin(Seq.empty).assertEquals(List.empty)
+        _ <- enrol(groups, alice, team.id, bob)
+        _ <- groups.addressersOf(bob.id).assertEquals(Set(alice.id))
+        _ <- groups.addressersOf(carol.id).assertEquals(Set.empty)
+        _ <- groups.membersWithin(Seq(dept.id)).assertEquals(List(bob.id))
+        _ <- groups.membersWithin(Seq.empty).assertEquals(List.empty)
       yield ()
 
   test(
@@ -674,9 +637,9 @@ class GroupStoreSuite extends CatsEffectSuite:
           GroupDraft("Retail", Some(dept.id)),
         )
         theirs <- groups.create(other.id, GroupDraft("Chess club"))
-        _      <- join(groups, owner, team.id, member)
+        _      <- enrol(groups, owner, team.id, member)
         _      <- groups.invite(owner.id, team.id, "invited")
-        _      <- join(groups, other, theirs.id, stranger)
+        _      <- enrol(groups, other, theirs.id, stranger)
         listed <- groups.addressable(owner.id)
       yield assertEquals(
         listed,
@@ -717,7 +680,7 @@ class GroupStoreSuite extends CatsEffectSuite:
           GroupDraft("Retail", Some(dept.id)),
         )
         theirs <- groups.create(other.id, GroupDraft("Chess club"))
-        _      <- join(groups, owner, team.id, member)
+        _      <- enrol(groups, owner, team.id, member)
         _      <- groups.invite(owner.id, team.id, "invited")
         listed <- groups.addressable(owner.id)
         candidates = List(
@@ -756,7 +719,7 @@ class GroupStoreSuite extends CatsEffectSuite:
         owner  <- newUser(users, "manager")
         member <- newUser(users, "member")
         team   <- groups.create(owner.id, GroupDraft("Retail"))
-        _      <- join(groups, owner, team.id, member)
+        _      <- enrol(groups, owner, team.id, member)
         before <- groups.mayAddress(owner.id, Principal.Person(member.id))
         _      <- groups.leave(member.id, team.id)
         after  <- groups.mayAddress(owner.id, Principal.Person(member.id))

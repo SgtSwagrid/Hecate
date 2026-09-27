@@ -24,6 +24,10 @@ object GroupApi:
     */
   val maxNameLength = Schemas.maxNameLength
 
+  /** The path of one group, which every endpoint about one group begins with. */
+  private def group: EndpointInput[Long] = "api" / "groups" /
+    path[Long]("group")
+
   /**
     * An endpoint that lists every group owned by the signed-in user, with their
     * members. Nesting is reconstructed by the reader from [[Group.parent]].
@@ -50,7 +54,7 @@ object GroupApi:
   val leave: AuthApi.Secured[Long, Unit] = AuthApi
     .secured
     .delete
-    .in("api" / "groups" / path[Long]("group") / "membership")
+    .in(group / "membership")
 
   /**
     * An endpoint that makes the signed-in user a member of one group they own,
@@ -60,7 +64,7 @@ object GroupApi:
   val join: AuthApi.Secured[Long, Unit] = AuthApi
     .secured
     .put
-    .in("api" / "groups" / path[Long]("group") / "membership")
+    .in(group / "membership")
 
   /**
     * An endpoint that lists the groups the signed-in user may ask to join:
@@ -84,7 +88,7 @@ object GroupApi:
   val request: AuthApi.Secured[Long, Unit] = AuthApi
     .secured
     .put
-    .in("api" / "groups" / path[Long]("group") / "request")
+    .in(group / "request")
 
   /**
     * An endpoint that withdraws the signed-in user's request to join one group.
@@ -93,7 +97,7 @@ object GroupApi:
   val retract: AuthApi.Secured[Long, Unit] = AuthApi
     .secured
     .delete
-    .in("api" / "groups" / path[Long]("group") / "request")
+    .in(group / "request")
 
   /**
     * An endpoint that stores a new group for the signed-in user, returning the
@@ -113,17 +117,14 @@ object GroupApi:
   val update: AuthApi.Secured[(Long, GroupDraft), Unit] = AuthApi
     .secured
     .put
-    .in("api" / "groups" / path[Long]("group"))
+    .in(group)
     .in(jsonBody[GroupDraft])
 
   /**
     * An endpoint that deletes one stored group, together with every group
     * nested beneath it.
     */
-  val delete: AuthApi.Secured[Long, Unit] = AuthApi
-    .secured
-    .delete
-    .in("api" / "groups" / path[Long]("group"))
+  val delete: AuthApi.Secured[Long, Unit] = AuthApi.secured.delete.in(group)
 
   /**
     * An endpoint that makes one group public, so that everyone can find it and
@@ -133,7 +134,7 @@ object GroupApi:
   val publish: AuthApi.Secured[(Long, Boolean), Unit] = AuthApi
     .secured
     .put
-    .in("api" / "groups" / path[Long]("group") / "public")
+    .in(group / "public")
     .in(jsonBody[Boolean])
 
   /**
@@ -144,7 +145,7 @@ object GroupApi:
   val link: AuthApi.Secured[Long, String] = AuthApi
     .secured
     .put
-    .in("api" / "groups" / path[Long]("group") / "invite-link")
+    .in(group / "invite-link")
     .out(jsonBody[String])
 
   /**
@@ -154,14 +155,14 @@ object GroupApi:
   val relink: AuthApi.Secured[Long, String] = AuthApi
     .secured
     .post
-    .in("api" / "groups" / path[Long]("group") / "invite-link")
+    .in(group / "invite-link")
     .out(jsonBody[String])
 
   /** An endpoint that turns off one group's invite link. */
   val unlink: AuthApi.Secured[Long, Unit] = AuthApi
     .secured
     .delete
-    .in("api" / "groups" / path[Long]("group") / "invite-link")
+    .in(group / "invite-link")
 
   /**
     * An endpoint that invites one user, named by username, to one group,
@@ -172,7 +173,7 @@ object GroupApi:
   val invite: AuthApi.Secured[(Long, Invite), User] = AuthApi
     .secured
     .post
-    .in("api" / "groups" / path[Long]("group") / "invitations")
+    .in(group / "invitations")
     .in(jsonBody[Invite])
     .out(jsonBody[User])
 
@@ -184,7 +185,7 @@ object GroupApi:
   val admit: AuthApi.Secured[(Long, Long), Unit] = AuthApi
     .secured
     .put
-    .in("api" / "groups" / path[Long]("group") / "members" / path[Long]("user"))
+    .in(group / "members" / path[Long]("user"))
 
   /**
     * An endpoint that removes one user from one group: a member, an invitee
@@ -193,7 +194,7 @@ object GroupApi:
   val withdraw: AuthApi.Secured[(Long, Long), Unit] = AuthApi
     .secured
     .delete
-    .in("api" / "groups" / path[Long]("group") / "members" / path[Long]("user"))
+    .in(group / "members" / path[Long]("user"))
 
   /** An endpoint that lists the pending invitations sent to the signed-in user. */
   val invitations: AuthApi.Secured[Unit, List[Invitation]] = AuthApi

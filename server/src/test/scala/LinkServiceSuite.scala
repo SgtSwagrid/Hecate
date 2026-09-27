@@ -1,21 +1,16 @@
 package com.alecdorrington.hecate
 package server
 
+import Fixtures.{give, read, serve, SendRequest}
 import cats.effect.IO
 import com.alecdorrington.hecate.api.AuthApi
 import com.alecdorrington.hecate.i18n.Wording
 import com.alecdorrington.hecate.model.{
-  Access, Credentials, Grant, GroupDraft, LinkPreview, LinkTarget, Principal,
-  Resource, User,
+  Access, GroupDraft, LinkPreview, LinkTarget, Principal, Resource, User,
 }
-import io.circe.parser.decode
-import io.circe.syntax.*
 import munit.CatsEffectSuite
 import slick.dbio.DBIO
-import sttp.client3.{basicRequest, Response, UriContext}
-import sttp.client3.impl.cats.CatsMonadAsyncError
-import sttp.client3.testing.SttpBackendStub
-import sttp.tapir.server.stub.TapirStubInterpreter
+import sttp.client3.{basicRequest, UriContext}
 
 /**
   * Tests of the endpoints [[LinkService]] serves: what an invite link shows
@@ -99,11 +94,11 @@ class LinkServiceSuite extends CatsEffectSuite:
         (owner, _)       <- world.signUp("owner")
         (reader, cookie) <- world.signUp("reader")
         (editor, theirs) <- world.signUp("editor")
-        _                <- world.grant(Grant(
+        _                <- give(world.grants, world.db)(
           book,
           Principal.Person(editor.id),
           Access.Edit,
-        ))
+        )
         code    <- world.share(owner, Access.View)
         preview <- world.preview(cookie, code)
         _       <- world.follow(cookie, code)
@@ -189,26 +184,12 @@ object LinkServiceSuite:
     */
   private final class World(val db: TestDb, send: SendRequest):
 
-    val users  = UserStore(TestDb.tables, db)
     val groups = GroupStore(TestDb.tables, db)
     val grants = GrantStore(TestDb.tables, db)
     val links  = LinkStore(TestDb.tables)
 
     /** Registers a user, yielding them and their session cookie. */
-    def signUp(name: String): IO[(User, String)] = send(
-      basicRequest
-        .post(uri"http://test/api/auth/register")
-        .body(Credentials(name, "hunter2222").asJson.noSpaces),
-    ).map(answer =>
-      (
-        answer
-          .body
-          .flatMap(decode[User](_).left.map(_.getMessage))
-          .toOption
-          .get,
-        answer.unsafeCookies.find(_.name == AuthApi.sessionCookie).get.value,
-      ),
-    )
+    def signUp(name: String): IO[(User, String)] = Fixtures.signUp(send, name)
 
     /** Where a link leads, as the user with the given session sees it. */
     def preview(cookie: String, code: String): IO[Either[String, LinkPreview]] =
@@ -238,19 +219,9 @@ object LinkServiceSuite:
       LinkTarget.Sharing(resource, access),
     ))
 
-    /** Stores one grant, as a host would. */
-    def grant(granted: Grant): IO[Unit] = db.run(grants.grant(granted))
-
     /** The access one user holds over a resource. */
     def accessOf(user: User, resource: Resource = book): IO[Option[Access]] =
       Permissions(groups, grants).access(user.id, resource)
-
-    /** The decoded body of a reply, or the refusal it carries. */
-    private def read[X : io.circe.Decoder]
-      (answer: Response[Either[String, String]])
-      : Either[String, X] = answer
-      .body
-      .flatMap(decode[X](_).left.map(_.getMessage))
 
   /** Runs a check against the endpoints and stores over a fresh database. */
   private def served(guesses: Int = 20)(check: World => IO[Unit]): IO[Unit] =
@@ -270,13 +241,4 @@ object LinkServiceSuite:
           resource => DBIO.successful(names.get(resource)),
           guesses = guesses,
         )
-        val backend = TapirStubInterpreter(
-          SttpBackendStub[IO, Any](CatsMonadAsyncError[IO]()),
-        ).whenServerEndpointsRunLogic(auth.api ++ service.api).backend()
-        check(World(db, request => request.send(backend)))
-
-  /** Sends one request to the endpoints under test. */
-  private type SendRequest =
-    sttp.client3.Request[Either[String, String], Any] => IO[
-      Response[Either[String, String]],
-    ]
+        check(World(db, serve(auth.api ++ service.api)))

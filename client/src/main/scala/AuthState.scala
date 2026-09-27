@@ -7,7 +7,7 @@ import com.alecdorrington.hecate.model.{
   RecoveryCodes, User,
 }
 import com.raquo.laminar.api.L.*
-import io.circe.Decoder
+import io.circe.{Decoder, Encoder}
 import io.circe.parser.decode
 import io.laminext.fetch.circe.*
 import scala.concurrent.ExecutionContext.Implicits.global
@@ -108,7 +108,7 @@ final class AuthState(wording: Wording = Wording.english):
     Fetch
       .get("/api/auth/rules")
       .text
-      .map(response => decoded[AuthRules](response))
+      .map(decoded[AuthRules])
       .recover { case _ => Some(None) }
       .foreach(rulesVar.set)
     // The count is the signed-in user's; with nobody signed in there is nothing
@@ -134,15 +134,10 @@ final class AuthState(wording: Wording = Wording.english):
     * @param attempt
     *   How many times the probe has already gone unanswered.
     */
-  private def probe(attempt: Int): Unit = Fetch
-    .get("/api/auth/me")
-    .text
-    .map(signedIn)
-    .recover { case _ => Some(None) }
-    .foreach:
-      case Some(found)                          => settle(found)
-      case None if attempt < AuthState.attempts => reprobe(attempt)
-      case None                                 => settle(None)
+  private def probe(attempt: Int): Unit = whoIsSignedIn.foreach:
+    case Some(found)                          => settle(found)
+    case None if attempt < AuthState.attempts => reprobe(attempt)
+    case None                                 => settle(None)
 
   /** Adopts the server's answer, and reports that the probe has answered. */
   private def settle(found: Option[User]): Unit =
@@ -157,22 +152,14 @@ final class AuthState(wording: Wording = Wording.english):
 
   /** Registers a new account under the given credentials, and signs in. */
   def register(username: String, password: String): Unit = signInWith(
-    Fetch
-      .post(
-        "/api/auth/register",
-        body = Credentials(username, password),
-      )
-      .text,
+    "/api/auth/register",
+    Credentials(username, password),
   )
 
   /** Signs in under the given credentials. */
   def signIn(username: String, password: String): Unit = signInWith(
-    Fetch
-      .post(
-        "/api/auth/login",
-        body = Credentials(username, password),
-      )
-      .text,
+    "/api/auth/login",
+    Credentials(username, password),
   )
 
   /**
@@ -186,18 +173,13 @@ final class AuthState(wording: Wording = Wording.english):
       replacement: String,
     )
     : Unit = signInWith(
-    Fetch
-      .post(
-        "/api/auth/recover",
-        body = Recovery(username, code, replacement),
-      )
-      .text,
+    "/api/auth/recover",
+    Recovery(username, code, replacement),
   )
 
   /** Signs out, closing the session on the server. */
   def signOut(): Unit =
-    errorVar.set(None)
-    noticeVar.set(None)
+    clearError()
     Fetch
       .post("/api/auth/logout")
       .text
@@ -270,14 +252,9 @@ final class AuthState(wording: Wording = Wording.english):
     */
   def recheck(): Unit = if !rechecking then
     rechecking = true
-    Fetch
-      .get("/api/auth/me")
-      .text
-      .map(signedIn)
-      .recover { case _ => Some(None) }
-      .foreach: answer =>
-        rechecking = false
-        answer.foreach(userVar.set)
+    whoIsSignedIn.foreach: answer =>
+      rechecking = false
+      answer.foreach(userVar.set)
 
   /**
     * Asks the server again who is signed in and how many recovery codes they
@@ -287,16 +264,11 @@ final class AuthState(wording: Wording = Wording.english):
     * as recovery codes just generated and not yet written down, is disturbed;
     * anyone else is adopted, as by [[recheck]].
     */
-  def refresh(): Unit = Fetch
-    .get("/api/auth/me")
-    .text
-    .map(signedIn)
-    .recover { case _ => Some(None) }
-    .foreach:
-      case Some(found) if found.map(_.id) == userVar.now().map(_.id) =>
-        if found.isDefined then refreshCodesLeft()
-      case Some(found) => userVar.set(found)
-      case None        => ()
+  def refresh(): Unit = whoIsSignedIn.foreach:
+    case Some(found) if found.map(_.id) == userVar.now().map(_.id) =>
+      if found.isDefined then refreshCodesLeft()
+    case Some(found) => userVar.set(found)
+    case None        => ()
 
   /** Discards the last error and notice, so that a fresh form starts clean. */
   def clearError(): Unit =
@@ -307,13 +279,16 @@ final class AuthState(wording: Wording = Wording.english):
   private def refreshCodesLeft(): Unit = Fetch
     .get("/api/auth/recovery-codes")
     .text
-    .map(response => decoded[Int](response))
+    .map(decoded[Int])
     .recover { case _ => Some(None) }
     .foreach(recoveryCodesLeftVar.set)
 
-  /** Runs a request that signs in, adopting the user it replies with. */
-  private def signInWith(request: EventStream[FetchResponse[String]]): Unit =
-    perform(request): response =>
+  /**
+    * Posts the given body to an endpoint that signs in, adopting the user it
+    * replies with.
+    */
+  private def signInWith[X : Encoder](url: String, body: X): Unit =
+    perform(Fetch.post(url, body = body).text): response =>
       decoded[User](response) match
         case None       => errorVar.set(Some(wording.unreadableReply))
         case Some(user) => userVar.set(Some(user))
@@ -327,8 +302,7 @@ final class AuthState(wording: Wording = Wording.english):
     (succeeded: FetchResponse[String] => Unit)
     : Unit =
     pendingVar.set(true)
-    errorVar.set(None)
-    noticeVar.set(None)
+    clearError()
     Replied
       .of(request)
       .foreach: outcome =>
@@ -337,6 +311,16 @@ final class AuthState(wording: Wording = Wording.english):
           case Replied.Answered(response) => succeeded(response)
           case Replied.Refused(problem)   => errorVar.set(Some(problem))
           case Replied.Unreachable(_) => errorVar.set(Some(wording.unreachable))
+
+  /**
+    * Asks the server who is signed in, as [[signedIn]] reads its reply: `None`
+    * when it says nothing, including when the request never reaches it.
+    */
+  private def whoIsSignedIn: EventStream[Option[Option[User]]] = Fetch
+    .get("/api/auth/me")
+    .text
+    .map(signedIn)
+    .recover { case _ => Some(None) }
 
   /**
     * Who a reply to `/api/auth/me` says is signed in, or `None` when it says

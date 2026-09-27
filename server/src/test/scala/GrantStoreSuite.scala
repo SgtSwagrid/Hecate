@@ -1,11 +1,12 @@
 package com.alecdorrington.hecate
 package server
 
+import Fixtures.{enrol, give, newUser}
 // The query syntax of the very profile the tables under test are built on.
 import TestDb.tables.profile.api.*
 import cats.effect.IO
 import com.alecdorrington.hecate.model.{
-  Access, Grant, Group, GroupDraft, Principal, Resource, User,
+  Access, Grant, GroupDraft, Principal, Resource,
 }
 import munit.CatsEffectSuite
 
@@ -21,39 +22,6 @@ class GrantStoreSuite extends CatsEffectSuite:
     : IO[Unit] = TestDb
     .open(s"grants-$name")
     .use(db => check(GrantStore(TestDb.tables, db), db))
-
-  /** Stores one grant, running the store's action to completion. */
-  private def give
-    (grants: GrantStore, db: TestDb)
-    (
-      resource: Resource,
-      principal: Principal,
-      access: Access,
-    )
-    : IO[Unit] = db.run(grants.grant(Grant(resource, principal, access)))
-
-  /** Registers a user for tests, yielding their assigned identifier. */
-  private def newUser(users: UserStore, name: String): IO[User] = users
-    .register(name, "hash")
-    .map(_.get)
-
-  /** Invites a user to a group and has them accept, making them a member. */
-  private def join
-    (
-      groups: GroupStore,
-      owner: User,
-      group: Group,
-      user: User,
-    )
-    : IO[Unit] =
-    for
-      _     <- groups.invite(owner.id, group.id, user.username)
-      found <- groups.invitations(user.id)
-      _     <- groups.accept(
-        user.id,
-        found.find(_.group.id == group.id).get.id,
-      )
-    yield ()
 
   test("nothing reaches anyone over an ungranted resource"):
     withStore("none"): (grants, _) =>
@@ -323,8 +291,8 @@ class GrantStoreSuite extends CatsEffectSuite:
             owner.id,
             GroupDraft("Retail", Some(dept.id)),
           )
-          _ <- join(groups, owner, team, inner)
-          _ <- join(groups, owner, dept, outer)
+          _ <- enrol(groups, owner, team.id, inner)
+          _ <- enrol(groups, owner, dept.id, outer)
           _ <- give(grants, db)(
             document,
             Principal.Group(dept.id),

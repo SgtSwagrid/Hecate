@@ -10,7 +10,6 @@ import com.alecdorrington.hecate.model.{
 }
 import scala.concurrent.duration.{DurationInt, FiniteDuration}
 import slick.dbio.DBIO
-import sttp.tapir.Endpoint
 import sttp.tapir.server.ServerEndpoint
 
 /**
@@ -146,14 +145,8 @@ final class LinkService
     * than failing the request.
     */
   private def told(user: Long, target: LinkTarget): IO[Unit] = (target match
-    case LinkTarget.Joining(group) => groups
-        .surroundings(Seq(group))
-        .map(around =>
-          Affected.Groups(
-            Audience.People(around.owners ++ around.members + user),
-            around.enclosing,
-          ),
-        )
+    case LinkTarget.Joining(group) =>
+      groups.surroundings(Seq(group)).map(_.joined(user))
     case LinkTarget.Sharing(resource, _) => IO.pure(Affected.Grants(resource))
   ).flatMap(affected).handleErrorWith(report)
 
@@ -202,16 +195,15 @@ final class LinkService
     .flatMap(_ => IO.raiseError(AuthProblem(AuthRefusal.LinkMissing)))
 
   /** The value found, or a refusal saying that the link leads nowhere. */
-  private def present[X](found: Option[X]): DBIO[X] = found.fold[DBIO[X]](
-    DBIO.failed(AuthProblem(AuthRefusal.LinkMissing)),
-  )(DBIO.successful)
+  private def present[X](found: Option[X]): DBIO[X] =
+    required(found, AuthRefusal.LinkMissing)
 
   /**
     * Serves one endpoint of [[LinkApi]]: the session is resolved to a caller,
     * the request answered, and any failure worded for them.
     */
   private def served[I, O]
-    (endpoint: Endpoint[AuthApi.Security, I, String, O, Any])
+    (endpoint: AuthApi.Secured[I, O])
     (run: Caller => I => IO[O])
     : ServerEndpoint[Any, IO] = endpoint
     .serverSecurityLogic(auth.require)
