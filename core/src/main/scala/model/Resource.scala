@@ -4,13 +4,10 @@ package model
 import io.circe.Codec
 
 /**
-  * One resource that access may be granted over, named in terms chosen by the
-  * host application, so that this library never needs to know what the
-  * application stores.
+  * A resource that access may be granted over, named in the host's own terms.
   *
   * @param kind
-  *   The kind of the resource (e.g. `document`), chosen by the host
-  *   application.
+  *   The kind of the resource (e.g. `document`), chosen by the host.
   *
   * @param id
   *   The identifier of the resource among those of its kind.

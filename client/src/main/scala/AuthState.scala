@@ -3,37 +3,31 @@ package client
 
 import com.alecdorrington.hecate.i18n.Wording
 import com.alecdorrington.hecate.model.{
-  AuthRules, Credentials, PasswordChange, PasswordCheck, Recovery,
-  RecoveryCodes, User,
+  AuthRules, Credentials, EmailChange, EmailConfirmation, EmailStatus, Guest,
+  LinkTarget, PasswordChange, PasswordCheck, PasswordReset,
+  PasswordResetRequest, Recovery, RecoveryCodes, User, Welcome,
 }
 import com.raquo.laminar.api.L.*
 import io.circe.{Decoder, Encoder}
 import io.circe.parser.decode
 import io.laminext.fetch.circe.*
 import scala.concurrent.ExecutionContext.Implicits.global
+import scala.scalajs.js.URIUtils.encodeURIComponent
 
 /**
-  * The browser-side account state, driving the endpoints of
-  * [[com.alecdorrington.hecate.api.AuthApi]]. The session itself lives in an
-  * HTTP-only cookie that the browser attaches to every same-origin request, so
-  * this holds only who the user is (discovered once on startup, and updated on
-  * each sign-in and sign-out) and the state of requests about their account.
-  *
-  * Headless by design: it exposes signals and commands, and the host
-  * application owns all rendering.
+  * A browser-side store of who is signed in and of requests about their
+  * account, driving the endpoints under `/api/auth`. The session itself is an
+  * HTTP-only cookie. Headless: it exposes signals and commands, and the host
+  * renders.
   *
   * @param wording
-  *   What this state says itself, in the language the host shows. The server's
-  *   refusals arrive already worded, in the language of the `language` cookie
-  *   the host sets.
+  *   The wording of this state's own messages. The server's refusals arrive
+  *   already worded, in the language of the `language` cookie.
   */
 final class AuthState(wording: Wording = Wording.english):
 
-  /**
-    * Everything here is bound to the page rather than to a view, since this
-    * state outlives any one view and every request it makes must arrive whether
-    * or not something is on screen to receive it.
-    */
+  // Bound to the page, not a view, so that every request arrives whether or not
+  // anything is on screen.
   private given Owner = unsafeWindowOwner
 
   private val userVar: Var[Option[User]] = Var(None)
@@ -46,29 +40,27 @@ final class AuthState(wording: Wording = Wording.english):
 
   private val pendingVar: Var[Boolean] = Var(false)
 
-  private val rulesVar: Var[Option[AuthRules]] = Var(None)
-
   private val recoveryCodesVar: Var[Option[List[String]]] = Var(None)
 
   private val recoveryCodesLeftVar: Var[Option[Int]] = Var(None)
 
-  /**
-    * Whether a [[recheck]] is waiting on the server. Mutable rather than a
-    * signal, as nothing observes it: it only keeps a burst of refused requests
-    * from each asking the same question.
-    */
+  private val emailVar: Var[Option[EmailStatus]] = Var(None)
+
+  /** Whether a [[recheck]] is in flight, so that a burst of refusals asks once. */
   private var rechecking = false
 
   /**
     * The signed-in user, or `None` while nobody is signed in. Its `changes`
-    * fire once the startup probe answers and on every subsequent sign-in and
-    * sign-out, so that other state can refetch whatever belongs to the user.
+    * fire once the startup probe answers and on every sign-in and sign-out.
     */
   val user: Signal[Option[User]] = userVar.signal
 
+  /** The id of the signed-in user, changing only as someone signs in or out. */
+  val userId: Signal[Option[Long]] = user.map(_.map(_.id)).distinct
+
   /**
-    * Whether the startup probe has answered. Until it has, nothing is known
-    * about the user, and a `None` [[user]] must not be read as "signed out".
+    * Whether the startup probe has answered. Until it has, a `None` [[user]]
+    * does not mean signed out.
     */
   val ready: Signal[Boolean] = readyVar.signal
 
@@ -76,9 +68,8 @@ final class AuthState(wording: Wording = Wording.english):
   val error: Signal[Option[String]] = errorVar.signal
 
   /**
-    * A confirmation that the last request about the account succeeded, for
-    * requests whose success is not otherwise visible, such as a password
-    * change.
+    * The confirmation that the last request about the account succeeded, where
+    * its success is not otherwise visible.
     */
   val notice: Signal[Option[String]] = noticeVar.signal
 
@@ -86,85 +77,138 @@ final class AuthState(wording: Wording = Wording.english):
   val pending: Signal[Boolean] = pendingVar.signal
 
   /**
-    * The server's rules for accounts, once fetched, so that a form can state
-    * them before a request is refused.
+    * The server's rules for accounts, fetched once, or `None` until they
+    * arrive.
     */
-  val rules: Signal[Option[AuthRules]] = rulesVar.signal
+  val rules: Signal[Option[AuthRules]] =
+    fetched("/api/auth/rules")(decoded[AuthRules]).startWith(None).observe
 
   /**
-    * A set of recovery codes just generated, which the server will never show
-    * again, until [[dismissRecoveryCodes]] is called once they are written
-    * down.
+    * The recovery codes just generated, which the server never shows again,
+    * until [[dismissRecoveryCodes]].
     */
   val recoveryCodes: Signal[Option[List[String]]] = recoveryCodesVar.signal
 
-  /** How many unused recovery codes the signed-in user has, once known. */
+  /** The number of unused recovery codes the signed-in user has, once known. */
   val recoveryCodesLeft: Signal[Option[Int]] = recoveryCodesLeftVar.signal
 
-  // The state lives as long as the page, so it probes here rather than relying
-  // on a view to remember to bind the request.
+  /**
+    * The signed-in user's email addresses, once known. Stays `None` where the
+    * server sends no email.
+    */
+  val email: Signal[Option[EmailStatus]] = emailVar.signal
+
   locally:
     probe(0)
-    Fetch
-      .get("/api/auth/rules")
-      .text
-      .map(decoded[AuthRules])
-      .recover { case _ => Some(None) }
-      .foreach(rulesVar.set)
-    // The count is the signed-in user's; with nobody signed in there is nothing
-    // to ask for, and asking would only be refused.
     user
       .changes
       .foreach: found =>
         recoveryCodesVar.set(None)
-        if found.isDefined then refreshCodesLeft()
-        else recoveryCodesLeftVar.set(None)
+        if found.isDefined then refreshAccount()
+        else
+          recoveryCodesLeftVar.set(None)
+          emailVar.set(None)
 
   /**
-    * Asks the server who is signed in, and adopts its answer, retrying a few
-    * times when the request never arrives.
-    *
-    * Only a definite answer settles it. A request that fails to reach the
-    * server says nothing about who is signed in, and adopting its silence would
-    * sign a signed-in user out, and show them a sign-in form, over one dropped
-    * request at startup. After [[AuthState.attempts]] such silences the server
-    * is taken to be unreachable and nobody is taken to be signed in, so that a
-    * page is never left waiting forever on a server that will not answer.
-    *
-    * @param attempt
-    *   How many times the probe has already gone unanswered.
+    * Asks the server who is signed in, retrying when the request never arrives,
+    * as adopting that silence would sign a signed-in user out. After
+    * [[AuthState.retries]] retries, nobody is taken to be signed in.
     */
-  private def probe(attempt: Int): Unit = whoIsSignedIn.foreach:
-    case Some(found)                          => settle(found)
-    case None if attempt < AuthState.attempts => reprobe(attempt)
-    case None                                 => settle(None)
+  private def probe(retry: Int): Unit = Outcome.once(whoIsSignedIn):
+    case Some(found)                       => settle(found)
+    case None if retry < AuthState.retries => reprobe(retry)
+    case None                              => settle(None)
 
-  /** Adopts the server's answer, and reports that the probe has answered. */
   private def settle(found: Option[User]): Unit =
     userVar.set(found)
     readyVar.set(true)
 
-  /** Probes again, once the wait between attempts has passed. */
-  private def reprobe(attempt: Int): Unit = EventStream
-    .fromValue(())
-    .delay(AuthState.retryMillis)
-    .foreach(_ => probe(attempt + 1))
+  private def reprobe(retry: Int): Unit = Outcome.once(
+    EventStream.fromValue(()).delay(AuthState.retryMillis),
+  )(_ => probe(retry + 1))
 
-  /** Registers a new account under the given credentials, and signs in. */
+  /**
+    * Registers an account and signs in to it.
+    *
+    * @param username
+    *   The username of the new account.
+    *
+    * @param password
+    *   The password of the new account.
+    */
   def register(username: String, password: String): Unit = signInWith(
     "/api/auth/register",
     Credentials(username, password),
   )
 
-  /** Signs in under the given credentials. */
+  /**
+    * Signs in to an existing account.
+    *
+    * @param username
+    *   The username of the account.
+    *
+    * @param password
+    *   The password of the account.
+    */
   def signIn(username: String, password: String): Unit = signInWith(
-    "/api/auth/login",
+    "/api/auth/sign-in",
     Credentials(username, password),
   )
 
   /**
-    * Regains an account whose password has been forgotten, with one of its
-    * recovery codes, setting a new password and signing in.
+    * Follows an invite link as a new guest and signs them in. If the link leads
+    * nowhere, no guest is made and [[error]] says why.
+    *
+    * @param code
+    *   The code of the link.
+    *
+    * @param name
+    *   The name the guest gives, which becomes their username.
+    *
+    * @param arrived
+    *   The callback given the link's target just before the guest is signed in.
+    */
+  def welcome(code: String, name: String)(arrived: LinkTarget => Unit): Unit =
+    perform(
+      Fetch
+        .post(
+          s"/api/invite-links/${ encodeURIComponent(code) }/welcome",
+          body = Guest(name),
+        )
+        .text,
+    ): response =>
+      adopt[Welcome](response): welcome =>
+        arrived(welcome.target)
+        userVar.set(Some(welcome.user))
+
+  /**
+    * Claims the signed-in guest's account with a username and password, signing
+    * out every other session.
+    *
+    * @param username
+    *   The username to sign in with.
+    *
+    * @param password
+    *   The password to sign in with.
+    */
+  def claim(username: String, password: String): Unit = signInWith(
+    "/api/auth/claim",
+    Credentials(username, password),
+    Some(wording.accountClaimed),
+  )
+
+  /**
+    * Regains an account with a recovery code, setting a new password and
+    * signing in.
+    *
+    * @param username
+    *   The username of the account.
+    *
+    * @param code
+    *   The unused recovery code.
+    *
+    * @param replacement
+    *   The new password.
     */
   def recover
     (
@@ -177,19 +221,106 @@ final class AuthState(wording: Wording = Wording.english):
     Recovery(username, code, replacement),
   )
 
-  /** Signs out, closing the session on the server. */
-  def signOut(): Unit =
-    clearError()
+  /**
+    * Asks for a link to reset a forgotten password to be emailed to every
+    * account with an address. The server and [[notice]] answer alike whether or
+    * not any account has it.
+    *
+    * @param address
+    *   The email address.
+    */
+  def requestPasswordReset(address: String): Unit = perform(
     Fetch
-      .post("/api/auth/logout")
-      .text
-      .map(_ => ())
-      .recover { case _ => Some(()) }
-      .foreach(_ => userVar.set(None))
+      .post(
+        "/api/auth/password/request-reset",
+        body = PasswordResetRequest(address),
+      )
+      .text,
+  )(_ => noticeVar.set(Some(wording.resetLinkSent)))
 
   /**
-    * Changes the signed-in user's password, given their current one. Every
-    * other session they had is signed out.
+    * Resets a forgotten password with a link sent by email and signs in,
+    * signing out every other session.
+    *
+    * @param token
+    *   The secret the link carries.
+    *
+    * @param replacement
+    *   The new password.
+    */
+  def resetPassword(token: String, replacement: String): Unit = signInWith(
+    "/api/auth/password/reset",
+    PasswordReset(token, replacement),
+    Some(wording.passwordChanged),
+  )
+
+  /**
+    * Changes the signed-in user's email address. A new address becomes theirs
+    * once they open the link sent to it.
+    *
+    * @param address
+    *   The new address, or `None` to remove it.
+    *
+    * @param password
+    *   The user's password.
+    */
+  def changeEmail
+    (
+      address: Option[String],
+      password: String,
+    )
+    : Unit = perform(
+    Fetch
+      .put(
+        "/api/auth/email",
+        body = EmailChange(address, password),
+      )
+      .text,
+  ): response =>
+    adoptEmail(response)(status =>
+      status
+        .pending
+        .map(wording.confirmationSent)
+        .orElse(Option.when(address.isEmpty)(wording.emailRemoved)),
+    )
+
+  /** Sends a new link to the address awaiting confirmation. */
+  def resendConfirmation(): Unit = perform(
+    Fetch.post("/api/auth/email/resend").text,
+  )(adoptEmail(_)(_.pending.map(wording.confirmationSent)))
+
+  /**
+    * Confirms an email address with the link sent to it, whoever is signed in.
+    *
+    * @param token
+    *   The secret the link carries.
+    */
+  def confirmEmail(token: String): Unit = perform(
+    Fetch
+      .post(
+        "/api/auth/email/confirm",
+        body = EmailConfirmation(token),
+      )
+      .text,
+  ): _ =>
+    noticeVar.set(Some(wording.emailConfirmed))
+    if userVar.now().isDefined then refreshEmail()
+
+  /** Signs out, closing the session on the server. */
+  def signOut(): Unit =
+    clearMessages()
+    Outcome.once(Outcome.of(Fetch.post("/api/auth/sign-out").text))(_ =>
+      userVar.set(None),
+    )
+
+  /**
+    * Changes the signed-in user's password, signing out every other session.
+    *
+    * @param current
+    *   The user's current password.
+    *
+    * @param replacement
+    *   The new password.
     */
   def changePassword(current: String, replacement: String): Unit = perform(
     Fetch
@@ -201,9 +332,11 @@ final class AuthState(wording: Wording = Wording.english):
   )(_ => noticeVar.set(Some(wording.passwordChanged)))
 
   /**
-    * Generates a fresh set of recovery codes, given the signed-in user's
-    * password, invalidating every earlier code. The new codes appear in
-    * [[recoveryCodes]].
+    * Generates a new set of recovery codes, shown in [[recoveryCodes]],
+    * invalidating every earlier code.
+    *
+    * @param password
+    *   The signed-in user's password.
     */
   def generateRecoveryCodes(password: String): Unit = perform(
     Fetch
@@ -213,18 +346,18 @@ final class AuthState(wording: Wording = Wording.english):
       )
       .text,
   ): response =>
-    decoded[RecoveryCodes](response) match
-      case None        => errorVar.set(Some(wording.unreadableReply))
-      case Some(codes) =>
-        recoveryCodesVar.set(Some(codes.codes))
-        recoveryCodesLeftVar.set(Some(codes.codes.size))
+    adopt[RecoveryCodes](response): codes =>
+      recoveryCodesVar.set(Some(codes.codes))
+      recoveryCodesLeftVar.set(Some(codes.codes.size))
 
-  /** Forgets the recovery codes just shown, once they have been written down. */
+  /** Forgets the recovery codes just shown. */
   def dismissRecoveryCodes(): Unit = recoveryCodesVar.set(None)
 
   /**
-    * Deletes the signed-in user's account and everything that belongs to it,
-    * given their password, then signs them out.
+    * Deletes the signed-in user's account, then signs them out.
+    *
+    * @param password
+    *   The user's password, not read for a guest.
     */
   def deleteAccount(password: String): Unit = perform(
     Fetch
@@ -236,104 +369,142 @@ final class AuthState(wording: Wording = Wording.english):
   )(_ => userVar.set(None))
 
   /**
-    * Asks the server again who is signed in, and adopts its answer. For a host
-    * application to call when a request that needs a signed-in user has been
-    * refused: every refusal from such an endpoint looks alike, whether the
-    * session has expired or the user simply may not do that, and this tells the
-    * two apart. An expired session signs the user out; anything else leaves
-    * them as they were.
-    *
-    * Only a definite answer is adopted. A request that fails to reach the
-    * server leaves the user as they were, so that a dropped connection is never
-    * mistaken for being signed out.
-    *
-    * Calls made while an earlier one is still waiting are dropped, as they ask
-    * the same question and that answer is no older than their own would be.
+    * Asks the server again who is signed in, for a host whose secured request
+    * was refused: an expired session signs the user out, and a plain refusal
+    * changes nothing. A request that never arrives changes nothing, and calls
+    * made while one is in flight are dropped.
     */
   def recheck(): Unit = if !rechecking then
     rechecking = true
-    whoIsSignedIn.foreach: answer =>
+    Outcome.once(whoIsSignedIn): answer =>
       rechecking = false
       answer.foreach(userVar.set)
 
   /**
-    * Asks the server again who is signed in and how many recovery codes they
-    * have left, as when told the account changed elsewhere: a session of theirs
-    * was closed, or their password or recovery codes were replaced. A user
-    * still signed in is left as they were, so that nothing following them, such
-    * as recovery codes just generated and not yet written down, is disturbed;
-    * anyone else is adopted, as by [[recheck]].
+    * Rereads who is signed in, their recovery codes left and their email
+    * address, as after a change to the account elsewhere. The same user,
+    * unchanged, is kept, so that codes just generated stay shown; anyone else
+    * is adopted, as by [[recheck]].
     */
-  def refresh(): Unit = whoIsSignedIn.foreach:
-    case Some(found) if found.map(_.id) == userVar.now().map(_.id) =>
-      if found.isDefined then refreshCodesLeft()
+  def refresh(): Unit = Outcome.once(whoIsSignedIn):
+    case Some(found) if found == userVar.now() =>
+      if found.isDefined then refreshAccount()
     case Some(found) => userVar.set(found)
     case None        => ()
 
-  /** Discards the last error and notice, so that a fresh form starts clean. */
-  def clearError(): Unit =
+  /** Discards the last error and notice. */
+  def clearMessages(): Unit =
     errorVar.set(None)
     noticeVar.set(None)
 
-  /** Refetches how many unused recovery codes the signed-in user has. */
-  private def refreshCodesLeft(): Unit = Fetch
-    .get("/api/auth/recovery-codes")
-    .text
-    .map(decoded[Int])
-    .recover { case _ => Some(None) }
-    .foreach(recoveryCodesLeftVar.set)
+  /**
+    * Runs a request to a secured endpoint, rechecking the session on a refusal,
+    * since an ended session is refused like anything else.
+    *
+    * @param request
+    *   The stream of the request's one reply.
+    *
+    * @return
+    *   A stream of its one outcome.
+    */
+  def outcome
+    (request: EventStream[FetchResponse[String]])
+    : EventStream[Outcome] = Outcome
+    .of(request)
+    .map: outcome =>
+      outcome match
+        case Outcome.Refused(_) => recheck()
+        case _                  => ()
+      outcome
 
   /**
-    * Posts the given body to an endpoint that signs in, adopting the user it
-    * replies with.
+    * Runs a request as [[outcome]] does, reading its answer, or why there is
+    * none. An empty reply reads as `null`, as one answering `Unit` does.
+    *
+    * @tparam X
+    *   The type of the answer.
+    *
+    * @param request
+    *   The stream of the request's one reply.
+    *
+    * @return
+    *   A stream of the answer, or the reason there is none.
     */
-  private def signInWith[X : Encoder](url: String, body: X): Unit =
-    perform(Fetch.post(url, body = body).text): response =>
-      decoded[User](response) match
-        case None       => errorVar.set(Some(wording.unreadableReply))
-        case Some(user) => userVar.set(Some(user))
+  def explained[X : Decoder]
+    (request: EventStream[FetchResponse[String]])
+    : EventStream[Either[String, X]] = outcome(request).map:
+    case Outcome.Answered(response) =>
+      decode[X](if response.data.isBlank then "null" else response.data)
+        .left
+        .map(_ => wording.unreadableReply)
+    case Outcome.Refused(reason) => Left(reason)
+    case Outcome.Unreachable(_)  => Left(wording.unreachable)
 
-  /**
-    * Runs one request about the account, tracking that it is in flight, and
-    * handing a successful response on, or recording why it was refused.
-    */
+  private def refreshAccount(): Unit =
+    refreshRecoveryCodesLeft()
+    refreshEmail()
+
+  private def refreshEmail(): Unit =
+    Outcome.once(fetched("/api/auth/email")(decoded[EmailStatus]))(emailVar.set)
+
+  private def adoptEmail
+    (response: FetchResponse[String])
+    (notice: EmailStatus => Option[String])
+    : Unit = adopt[EmailStatus](response): status =>
+    emailVar.set(Some(status))
+    noticeVar.set(notice(status))
+
+  private def refreshRecoveryCodesLeft(): Unit = Outcome.once(
+    fetched("/api/auth/recovery-codes")(decoded[Int]),
+  )(recoveryCodesLeftVar.set)
+
+  private def signInWith[X : Encoder]
+    (
+      url: String,
+      body: X,
+      notice: Option[String] = None,
+    )
+    : Unit = perform(Fetch.post(url, body = body).text): response =>
+    adopt[User](response): user =>
+      userVar.set(Some(user))
+      if notice.isDefined then noticeVar.set(notice)
+
   private def perform
     (request: EventStream[FetchResponse[String]])
     (succeeded: FetchResponse[String] => Unit)
     : Unit =
-    pendingVar.set(true)
-    clearError()
-    Replied
-      .of(request)
-      .foreach: outcome =>
-        pendingVar.set(false)
-        outcome match
-          case Replied.Answered(response) => succeeded(response)
-          case Replied.Refused(problem)   => errorVar.set(Some(problem))
-          case Replied.Unreachable(_) => errorVar.set(Some(wording.unreachable))
+    clearMessages()
+    Outcome.tracked(Outcome.of(request), pendingVar):
+      case Outcome.Answered(response) => succeeded(response)
+      case Outcome.Refused(reason)    => errorVar.set(Some(reason))
+      case Outcome.Unreachable(_)     => errorVar.set(Some(wording.unreachable))
 
-  /**
-    * Asks the server who is signed in, as [[signedIn]] reads its reply: `None`
-    * when it says nothing, including when the request never reaches it.
-    */
-  private def whoIsSignedIn: EventStream[Option[Option[User]]] = Fetch
-    .get("/api/auth/me")
+  /** Asks who is signed in: `None` when there is no answer. */
+  private def whoIsSignedIn: EventStream[Option[Option[User]]] =
+    fetched("/api/auth/me")(signedIn)
+
+  /** `None` when the request never reaches the server. */
+  private def fetched[X]
+    (url: String)
+    (read: FetchResponse[String] => Option[X])
+    : EventStream[Option[X]] = Fetch
+    .get(url)
     .text
-    .map(signedIn)
+    .map(read)
     .recover { case _ => Some(None) }
 
-  /**
-    * Who a reply to `/api/auth/me` says is signed in, or `None` when it says
-    * nothing, as when it was refused or cannot be read. Nobody signed in is an
-    * empty body, not `null`, which is how an absent value is sent, and would
-    * otherwise read as saying nothing, so that a session ended elsewhere was
-    * never noticed.
-    */
+  private def adopt[X : Decoder]
+    (response: FetchResponse[String])
+    (use: X => Unit)
+    : Unit =
+    decoded[X](response).fold(errorVar.set(Some(wording.unreadableReply)))(use)
+
+  // Nobody signed in is sent as an empty body, not `null`, which would
+  // otherwise read as no answer and leave an ended session unnoticed.
   private def signedIn(response: FetchResponse[String]): Option[Option[User]] =
     if response.status < 400 && response.data.isBlank then Some(None)
     else decoded[Option[User]](response)
 
-  /** Decodes a successful JSON response, or `None` when it cannot be read. */
   private def decoded[X : Decoder](response: FetchResponse[String]): Option[X] =
     Option
       .when(response.status < 400)(decode[X](response.data).toOption)
@@ -341,11 +512,7 @@ final class AuthState(wording: Wording = Wording.english):
 
 object AuthState:
 
-  /**
-    * How many times a startup probe that never arrives is sent again before the
-    * server is taken to be unreachable.
-    */
-  private val attempts = 3
+  /** The number of retries of an unanswered startup probe. */
+  private val retries = 3
 
-  /** How long to wait between probes, in milliseconds. */
   private val retryMillis = 1000

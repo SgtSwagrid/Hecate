@@ -2,39 +2,53 @@ package com.alecdorrington.hecate
 package model
 
 /**
-  * Every reason this library refuses a request, as a value rather than a
-  * sentence, so that the sentence can be written in the reader's language by
-  * the [[com.alecdorrington.hecate.i18n.Wording]] the host application gives.
-  * The server raises and reports these; nothing here says how they read.
+  * A reason this library refuses a request, as a value that the host's
+  * [[com.alecdorrington.hecate.i18n.Wording]] phrases in the reader's language.
   */
 enum AuthRefusal:
 
   /** An endpoint that needs a signed-in user was called without one. */
   case SignedOut
 
-  /** A registration asked for a username that exists already. */
+  /** A registration asked for a username that is taken. */
   case UsernameTaken
 
   /**
-    * A sign-in failed. One reason for both halves, deliberately: it must not
-    * say which was wrong, or it could be used to find valid usernames.
+    * A sign-in failed. It never says whether the username or the password was
+    * wrong, so that it cannot be used to find valid usernames.
     */
-  case IncorrectCredentials
+  case CredentialsIncorrect
 
-  /** A confirming password, given again for a consequential request, is wrong. */
-  case IncorrectPassword
+  /** A password given again to confirm a request is wrong. */
+  case PasswordIncorrect
 
   /**
-    * A recovery failed, saying nothing about which part was wrong, for the same
-    * reason as [[IncorrectCredentials]].
+    * A recovery failed. It never says which part was wrong, as for
+    * [[CredentialsIncorrect]].
     */
-  case IncorrectRecovery
+  case RecoveryIncorrect
 
-  /** The host application offers no account deletion. */
+  /** The host offers no account deletion. */
   case NoAccountDeletion
 
   /** A registration asked for a blank username. */
-  case EmptyUsername
+  case UsernameEmpty
+
+  /** Someone asked to follow an invite link as a guest without giving a name. */
+  case GuestNameEmpty
+
+  /** The host lets nobody follow an invite link as a guest. */
+  case NoGuests
+
+  /**
+    * No link may be followed as a guest for a while, as guests lately tried too
+    * many codes that lead nowhere. Every code is refused alike meanwhile, so
+    * this discloses nothing about the code tried.
+    */
+  case GuestsPaused
+
+  /** An account to be claimed has a password; only a guest's can be claimed. */
+  case NotGuest
 
   /**
     * A password is shorter than the policy allows.
@@ -45,17 +59,24 @@ enum AuthRefusal:
   case PasswordTooShort(min: Int)
 
   /**
-    * An invitation named a user nobody is named.
+    * A name, code or password is longer than this library stores or compares.
     *
-    * @param username
-    *   The username the invitation asked for.
+    * @param max
+    *   The most characters it may have.
     */
-  case NoSuchUser(username: String)
+  case TooLong(max: Int)
 
   /**
-    * A request named a group that does not exist, or that belongs to somebody
-    * else. One reason for both, so that nothing is disclosed about other users'
-    * groups.
+    * An invitation named a username that nobody has.
+    *
+    * @param username
+    *   The username the invitation named.
+    */
+  case UserMissing(username: String)
+
+  /**
+    * A request named a group that does not exist, or one the caller may not act
+    * on. One reason for both, to disclose nothing about other users' groups.
     */
   case GroupMissing
 
@@ -66,15 +87,15 @@ enum AuthRefusal:
   case InvitationMissing
 
   /**
-    * An owner admitted someone to a group who has not asked to join it, or who
-    * has since withdrawn their request.
+    * An owner admitted someone who has not asked to join the group, or who has
+    * withdrawn their request.
     */
   case RequestMissing
 
   /**
-    * An invite link was opened whose secret matches no group's: it never
-    * existed, or its owner has since replaced it or turned it off. One reason
-    * for all three, as for [[GroupMissing]].
+    * An invite link was opened whose code leads nowhere: it never existed, or
+    * was replaced or turned off. One reason for all three, as for
+    * [[GroupMissing]].
     */
   case LinkMissing
 
@@ -88,12 +109,59 @@ enum AuthRefusal:
     * An account cannot be deleted while it is the only owner of something.
     *
     * @param count
-    *   How many things it is the only owner of.
+    *   The number of resources the account alone owns.
     */
   case SoleOwner(count: Int)
 
   /**
-    * A request failed for a reason that is not the user's to understand, whose
-    * detail stays on the server.
+    * A request named a resource that does not exist or that the caller may not
+    * see, alike so that identifiers cannot be probed.
+    *
+    * @param kind
+    *   The kind of the resource, as the host names it.
     */
+  case ResourceMissing(kind: String)
+
+  /**
+    * Someone who may see a resource but does not own it asked to see or change
+    * who holds it.
+    *
+    * @param kind
+    *   The kind of the resource, as the host names it.
+    */
+  case NotOwner(kind: String)
+
+  /**
+    * A change would leave a resource with nobody holding [[Access.Own]].
+    *
+    * @param kind
+    *   The kind of the resource, as the host names it.
+    */
+  case LastOwner(kind: String)
+
+  /** An invite link was to grant [[Access.Own]], which only naming someone may. */
+  case OwnershipByLink
+
+  /**
+    * A grant named a user or group that does not exist or that the caller may
+    * not address, alike as for [[GroupMissing]].
+    */
+  case PrincipalMissing
+
+  /** A given email address is not valid. */
+  case EmailInvalid
+
+  /**
+    * A link sent by email has expired, been used, or never existed. One reason
+    * for all three, to disclose nothing about links sent to anybody else.
+    */
+  case EmailLinkMissing
+
+  /** The host sends no email. */
+  case NoEmail
+
+  /** A user asked for an email too soon after the last one sent to them. */
+  case MailedRecently
+
+  /** A request failed for an internal reason, whose detail stays on the server. */
   case Failed

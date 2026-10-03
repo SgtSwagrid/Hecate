@@ -12,32 +12,91 @@ Keep it concise and actionable.
 ## Project overview
 
 This is Hecate, a Scala 3 library for user accounts, sign-in sessions, nestable user groups and permissions,
-for full stack websites built on Tapir, Slick, Cats Effect and Laminar. It is in beta.
+for full stack websites built on Slick, Cats Effect and Laminar, and optionally Tapir. It is in beta.
 
 - `core` (`com.alecdorrington.hecate`, JVM + JS) - the model (`User`, `Caller`, `Group`, `Principal`, `Access`,
   `Grant`, `Resource`, `Permitted`, `Gated`, `AuthRefusal`), the wording of what the library says (`i18n/Wording`)
-  and the Tapir endpoint definitions (`api/AuthApi`).
-- `server` (`com.alecdorrington.hecate.server`) - password hashing, persistence and the endpoint implementations.
+  and `api/Protocol`, what every server and client agree on whatever serves the requests: the cookies' names, and
+  the bounds on the text a request carries.
+- `server` (`com.alecdorrington.hecate.server`) - password hashing, persistence and the services (`AuthService`,
+  `GroupService`, `LinkService`, `SharingService`), which know nothing of HTTP: each request is a method taking the signed-in `User`
+  and answering an `Answer[X]` (`IO[Either[AuthRefusal, X]]`), never a failed `IO` (`Failures` answers an
+  `AuthProblem` with its refusal, and reports anything else and answers `Failed`). A request that opens or ends a
+  session answers the `SessionCookie` to set, and `Bounds` refuses text longer than `Protocol` allows (`TooLong`)
+  before anything else is done with it, as a host serving the services without Tapir has no schema to do it.
   It opens no database but takes a `Transactor`; its tables are defined against a `JdbcProfile` passed to `AuthTables`
   rather than a fixed one, so identifiers go through the `prefix` parameter, never string literals; and it deletes
   nothing of the host's, taking instead a cascade hook run inside its own deletion transactions.
   It creates its own tables (`AuthTables.createIfNotExists`) and has no migrations.
   Every row lock goes through `AuthTables.locked`, never `.forUpdate` itself: Slick's SQLite profile
   lacks the capability yet still writes `FOR UPDATE`, which SQLite refuses. `Passwords` is told every
-  iteration count (`AuthPolicy.hashingRounds`, for new hashes, rehashing and the decoy alike), and
-  `Passwords.iterations` is only the policy's default, so that the host's count is never overridden.
+  iteration count (`AuthPolicy.hashIterations`, for new hashes, rehashing and the decoy alike), and
+  `Passwords.defaultIterations` is only the policy's default, so that the host's count is never overridden.
+  Usernames are shown as chosen but matched in any letter case: `users.username_key` (unique) holds
+  `Username.key` of the name, written by the table's own projection from `UserRow.username`, so every
+  lookup by name filters on the key, never on `username`, and an update of the name updates both.
   Groups are joined by invitation, by a request the owner admits (only of a group the asker can see:
   public, or nested in one they belong to), or by an invite link; `LinkStore`/`LinkService` keep one link
   per group or resource, each a random `InviteCode` (five of a-z0-9, any case, always a digit), and a link
   to a resource grants its level through `GrantStore.raise`, under the row lock the host's `resources` hook takes.
-- `client` (`com.alecdorrington.hecate.client`) - headless Laminar state (`AuthState`, `GroupsState`).
+  `SharingService` lets a resource's owners (by the host's `access` hook, else stored grants) see and change who
+  holds it and manage its link, under the same lock: a resource is never left with nobody holding `Own`
+  (`SharingService.orphans`, checked inside the locked transaction), no link grants `Own`, and only a principal
+  the owner may address (`GroupStore.mayAddress`) is granted anything. Deleting a group grants its owner `Own`
+  over whatever the group and those nested in it alone owned (`GroupStore.handOver`), so that rule holds there too,
+  and tells the host as `Affected.Grants`. `GroupStore` takes the same `resources` hook for it, and `GroupStore.delete`
+  locks in the order sharing and account deletion do: the groups' resources (found unlocked first, and any found since
+  once the groups are locked), the owner's row, then the owner's groups; sole ownership is read again under them, and a
+  resource the hook no longer finds passes to nobody.
+  Email is off unless the host passes `AuthService` a `Mailing`: its `Mailer` (the library connects to no mail
+  server), the site's name, the pages the links lead to (built from the host's own base URL, never the `Host`
+  header) and the wording the mail is written in. `users.email` holds an address only once the link sent to it
+  is opened; links live in `email_links` as hashes, by `EmailPurpose` (`Reset`, `Confirm`), issued under the
+  user's row lock (which using one takes first too): a confirmation replaces the last, a reset does not.
+  `sent_mails` records every mail for a day, counted against `mailIntervalSeconds` per user and purpose and
+  `addressMailsPerHour` per address, failed sends included. Every link dies with a password change, a reset
+  link with a confirmed address, and a reset is only issued for the address its user holds now. The address
+  replaced or removed is sent a notice (`Mailing.addressChangedMail`). `requestPasswordReset` answers at once and sends in the
+  background, alike for any address, so that it cannot tell whose addresses are known; changing an address
+  needs the password, and its confirmation mail names no account.
+  A *guest* (`User.guest`) is an account with no password (`users.password_hash` is `NULL`), made only to follow an
+  invite link, where `AuthPolicy.guests` lets guests in: `LinkService.welcome(code, name)` (given the
+  `AuthService` as `guests`) makes the guest, gives them what the link leads to and opens their one session
+  in one transaction (`AuthService.createGuest(name)(arrival)`, `UserStore.createGuest`), so that a dead link makes
+  nobody. Their username is the name they gave, numbered where taken (`Sam 2`; `UserStore.numbered`, the
+  whole transaction retried when two of one name race to a number). Nobody signs in to a guest: `verified`
+  checks them against the decoy, as for an unknown username, so they cannot be told apart; they delete
+  their account without a password, and `claim` (`POST /api/auth/claim`, under the row lock) gives it a
+  username and password, refused `NotGuest` for anyone else. People not signed in are one `None` key of
+  `LinkService`'s miss counter, with their own allowance (`strangerGuesses`): past it every stranger is told
+  `GuestsPaused`, uncounted, while everyone signed in is unaffected. Never let a guest be made without a
+  code that leads somewhere, or it becomes a way round that counter.
+- `tapir` (`com.alecdorrington.hecate.tapir`, JVM + JS) - the Tapir endpoint descriptions (`AuthApi`, `GroupApi`,
+  `LinkApi`, `SharingApi.of(segment)` per kind of resource), and `Schemas`, public so that a host's own
+  endpoints carrying the model import them rather than derive their own (the hand-written codecs' shapes, as
+  `Principal`'s and `Gated`'s, are described only here), whose schemas bound text as `Protocol` does;
+  `Principals.path` is a principal in a path.
+- `server-tapir` (`com.alecdorrington.hecate.server.tapir`) - the services served as those endpoints: `AuthEndpoints`
+  (with `authenticate`, the security logic of every endpoint built on `AuthApi.secured`, and the wording every refusal
+  is written in), `GroupEndpoints`, `LinkEndpoints` and `SharingEndpoints`. Only `tapir` and `server-tapir` depend on Tapir: keep it
+  that way, so that a host serving its endpoints with anything else never needs it.
+  Tapir also brought `scala-java-time` (and `java.util.Locale`) to every JS module, silently, so nothing in `core`
+  or `client` may use `java.time` or `java.util.Locale` now: Scala.js lacks them, and only linking JS shows it.
+- `client` (`com.alecdorrington.hecate.client`) - headless Laminar state (`AuthState`, `GroupsState`), and what a
+  view makes for itself and binds (`SharingState`, `InviteLinks`, `Recipients`). Every request to a secured
+  endpoint goes through `AuthState.outcome`/`explained`, which recheck the session on a refusal, as an ended
+  session is refused with the same status as anything else. A request a state outliving every view makes goes
+  through `Outcome.once` (or `Outcome.tracked`, which also marks it in flight), which lets go of it once it has
+  answered; never `foreach` one on the window owner, which would keep every finished request subscribed.
 
 The library tells the host whom each change it makes concerns, never what changed, through the `affected:
-Affected => IO[Unit]` hook of `GroupService`, `LinkService` and `AuthService` (default: tell nobody), once the
+Affected => IO[Unit]` hook of `GroupService`, `LinkService`, `SharingService` and `AuthService` (default: tell nobody), once the
 change is committed, so that a host with a socket can tell them to read again. A change to who is in a group
 (or to its link) concerns its owner, its members (who see one another) and that person; a change to the group itself concerns everyone who saw
 anything of it before or after (`GroupStore.surroundings`, asked before and after), and `Audience.Everyone`
-when it was or is public; a followed link to a resource is `Affected.Grants`, whose audience the host knows;
+when it was or is public; a followed link, a share or a changed link of a resource is `Affected.Grants`, whose audience the host knows,
+with `formerly`, everyone the grants reached before, read under the resource's lock (`Permissions.holding`) and only
+when the change lowers or withdraws someone's access (`SharingService.takes`), else empty;
 signing out, a new password or codes and recovery are `Affected.Account`; deleting an account concerns
 everyone. A failure to work out an audience is reported, never failing the request. `Permissions.holders` is
 the reverse of `access`: everyone a grant over a resource reaches. `AuthState.refresh` reads the account again
@@ -48,10 +107,11 @@ session that had ended.
 
 The library never picks a language or writes a sentence of its own. A refusal is an `AuthRefusal` value;
 `Wording` (one member per phrase, so adding one fails every implementation until it is translated) turns one
-into a sentence, and the host passes `wording: Option[String] => Wording` to `AuthService`, `GroupService` and
+into a sentence. The services answer refusals as values and never word them; the host passes
+`wording: Option[String] => Wording` to `AuthEndpoints` (which `GroupEndpoints` and `LinkEndpoints` share) and to
 `AuthState`, defaulting to `Wording.english`. The language arrives as a `language` cookie
-(`AuthApi.languageCookie`) read by `AuthApi.secured` and by `register`/`login`/`recover`, so
-`AuthApi.Security` is `(session, language)` and `AuthService.require` answers a `Caller` (user plus locale).
+(`Protocol.languageCookie`) read by `AuthApi.secured` and by `register`/`signIn`/`recover`, so
+`AuthApi.Security` is `(session, language)` and `AuthEndpoints.authenticate` answers a `Caller` (user plus locale).
 `AuthProblem` carries the refusal, and its `getMessage` is the English phrase, for logs and message-based tests.
 
 See [README.md](README.md) for how a host wires it up.
@@ -67,11 +127,12 @@ other than `plugins-scalajs.sbt`) comes from further upstream still, in
 
 ### Build
 
-- `hecateCore` is a `projectMatrix` (JVM + JS; the JS row is `hecateCoreJS`), `hecateServer` is JVM, `hecateClient` is
-  Scala.js, and the root project `hecate` only aggregates them and is never published.
+- `hecateCore` and `hecateTapir` are `projectMatrix`es (JVM + JS; the JS rows are `hecateCoreJS` and `hecateTapirJS`),
+  `hecateServer` and `hecateServerTapir` are JVM (the latter depends on the former's tests too, for `TestDb` and
+  `Fixtures`), `hecateClient` is Scala.js, and the root project `hecate` only aggregates them and is never published.
 - Project ids are prefixed with the library's name because the private project includes this build by reference
   (`ProjectRef(file("hecate"), ...)`), and its own projects are called `server`, `client` and `common`.
-- The matrix pins `sourceDirectory` to `(ThisBuild / baseDirectory) / "core" / "src"`. Don't remove it: sbt 2.0.8
+- Each matrix pins `sourceDirectory` to `(ThisBuild / baseDirectory) / "<module>" / "src"`. Don't remove it: sbt 2.0.8
   resolves a matrix's sources against the working directory, which is the host's when the build is included by reference,
   and the library then compiles to an empty JAR without a single error of its own.
 - The library must never depend on anything in the project that includes it, and nothing here should assume a host, a database or a JDBC profile.
@@ -96,6 +157,11 @@ other than `plugins-scalajs.sbt`) comes from further upstream still, in
 ### Code Style
 
 - You must read the [Code Style Guidelines](docs/STYLE_GUIDE.md).
+- Document every public type and member: a summary, then `@param` for each explicit parameter,
+  `@tparam` for each type parameter, and `@return` for any result but `Unit`, each one short
+  sentence. Summaries read: types "A ...", values "The ...", Booleans "Whether ...", methods a
+  third-person verb ("Sends ..."), never "Returns ...". Private members get a comment only for a
+  non-obvious contract or gotcha, usually in one sentence.
 
 ### Pull Requests
 

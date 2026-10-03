@@ -1,22 +1,15 @@
 package com.alecdorrington.hecate
 package server
 
-import Fixtures.{enrol, serve, SendRequest}
+import Fixtures.{cheap, enrol}
 import cats.effect.{IO, Ref}
-import com.alecdorrington.hecate.api.AuthApi
 import com.alecdorrington.hecate.model.{
-  Access, GroupDraft, LinkTarget, PasswordChange, Resource, User,
+  Access, GroupDetails, LinkTarget, PasswordChange, Resource, User,
 }
-import io.circe.syntax.*
 import munit.CatsEffectSuite
 import slick.dbio.DBIO
-import sttp.client3.{basicRequest, UriContext}
 
-/**
-  * Tests of whom the services say each change concerns, through their
-  * `affected` hook: nobody who sees nothing of it, and nobody left out who did,
-  * before the change or after it.
-  */
+/** Tests of whom the services' `affected` hook says each change concerns. */
 class AffectedSuite extends CatsEffectSuite:
 
   import AffectedSuite.*
@@ -24,19 +17,19 @@ class AffectedSuite extends CatsEffectSuite:
   test("joining or leaving a group concerns its members, who see one another"):
     served: world =>
       for
-        (owner, _)       <- world.signUp("owner")
-        (member, _)      <- world.signUp("member")
-        (leaver, cookie) <- world.signUp("leaver")
-        (_, outsider)    <- world.signUp("outsider")
-        team             <- world.groups.create(owner.id, GroupDraft("Team"))
-        _                <- world.join(owner, team.id, member)
-        _                <- world.join(owner, team.id, leaver)
-        other            <- world.groups.create(owner.id, GroupDraft("Other"))
-        code             <- world.groups.link(owner.id, other.id)
-        _                <- world.follow(outsider, code)
-        _                <- world.reported
-        _                <- world.leave(cookie, team.id)
-        told             <- world.reported
+        owner    <- world.signUp("owner")
+        member   <- world.signUp("member")
+        leaver   <- world.signUp("leaver")
+        outsider <- world.signUp("outsider")
+        team     <- world.groups.create(owner.id, GroupDetails("Team"))
+        _        <- world.join(owner, team.id, member)
+        _        <- world.join(owner, team.id, leaver)
+        other    <- world.groups.create(owner.id, GroupDetails("Other"))
+        code     <- world.groups.link(owner.id, other.id)
+        _        <- world.linking.follow(outsider, code)
+        _        <- world.reported
+        _        <- world.service.leave(leaver, team.id)
+        told     <- world.reported
       yield assertEquals(
         told,
         List(Affected.Groups(
@@ -48,69 +41,71 @@ class AffectedSuite extends CatsEffectSuite:
   test("joining a group concerns its owner and the joiner, and its enclosure"):
     served: world =>
       for
-        (owner, _)       <- world.signUp("owner")
-        (other, _)       <- world.signUp("other")
-        (joiner, cookie) <- world.signUp("joiner")
-        school           <- world.groups.create(owner.id, GroupDraft("School"))
-        _    <- world.groups.invite(owner.id, school.id, other.username)
-        team <- world
+        owner   <- world.signUp("owner")
+        other   <- world.signUp("other")
+        joiner  <- world.signUp("joiner")
+        company <- world.groups.create(owner.id, GroupDetails("Company"))
+        _       <- world.groups.invite(owner.id, company.id, other.username)
+        team    <- world
           .groups
           .create(
             owner.id,
-            GroupDraft("Team", Some(school.id)),
+            GroupDetails("Team", Some(company.id)),
           )
         code <- world.groups.link(owner.id, team.id)
         _    <- world.reported
-        _    <- world.follow(cookie, code)
+        _    <- world.linking.follow(joiner, code)
         told <- world.reported
       yield assertEquals(
         told,
         List(Affected.Groups(
           Audience.People(Set(owner.id, joiner.id)),
-          Set(team.id, school.id),
+          Set(team.id, company.id),
         )),
       )
 
   test("renaming a group concerns whoever sees it, and not whoever is in it"):
     served: world =>
       for
-        (owner, cookie) <- world.signUp("owner")
-        (member, _)     <- world.signUp("member")
-        (invitee, _)    <- world.signUp("invitee")
-        _               <- world.signUp("stranger")
-        school          <- world.groups.create(owner.id, GroupDraft("School"))
-        team            <- world
+        owner   <- world.signUp("owner")
+        member  <- world.signUp("member")
+        invitee <- world.signUp("invitee")
+        _       <- world.signUp("stranger")
+        company <- world.groups.create(owner.id, GroupDetails("Company"))
+        team    <- world
           .groups
           .create(
             owner.id,
-            GroupDraft("Team", Some(school.id)),
+            GroupDetails("Team", Some(company.id)),
           )
-        _ <- world.join(owner, school.id, member)
+        _ <- world.join(owner, company.id, member)
         _ <- world.groups.invite(owner.id, team.id, invitee.username)
         _ <- world.reported
-        _ <- world.rename(
-          cookie,
-          team.id,
-          GroupDraft("Squad", Some(school.id)),
-        )
+        _ <- world
+          .service
+          .update(
+            owner,
+            team.id,
+            GroupDetails("Squad", Some(company.id)),
+          )
         told <- world.reported
       yield assertEquals(
         told,
         List(Affected.Groups(
           Audience.People(Set(owner.id, member.id, invitee.id)),
-          Set(team.id, school.id),
+          Set(team.id, company.id),
         )),
       )
 
   test("a group anyone may find concerns everyone, as does leaving it public"):
     served: world =>
       for
-        (owner, cookie) <- world.signUp("owner")
-        club            <- world.groups.create(owner.id, GroupDraft("Club"))
-        _               <- world.publish(cookie, club.id, public = true)
-        opened          <- world.reported
-        _               <- world.publish(cookie, club.id, public = false)
-        closed          <- world.reported
+        owner  <- world.signUp("owner")
+        club   <- world.groups.create(owner.id, GroupDetails("Club"))
+        _      <- world.service.setPublic(owner, club.id, public = true)
+        opened <- world.reported
+        _      <- world.service.setPublic(owner, club.id, public = false)
+        closed <- world.reported
       yield
         assertEquals(
           opened,
@@ -124,33 +119,33 @@ class AffectedSuite extends CatsEffectSuite:
   test("deleting a group concerns whoever was in it and its subgroups"):
     served: world =>
       for
-        (owner, cookie) <- world.signUp("owner")
-        (member, _)     <- world.signUp("member")
-        school          <- world.groups.create(owner.id, GroupDraft("School"))
-        team            <- world
+        owner   <- world.signUp("owner")
+        member  <- world.signUp("member")
+        company <- world.groups.create(owner.id, GroupDetails("Company"))
+        team    <- world
           .groups
           .create(
             owner.id,
-            GroupDraft("Team", Some(school.id)),
+            GroupDetails("Team", Some(company.id)),
           )
         _    <- world.join(owner, team.id, member)
         _    <- world.reported
-        _    <- world.delete(cookie, school.id)
+        _    <- world.service.delete(owner, company.id)
         told <- world.reported
       yield assertEquals(
         told,
         List(Affected.Groups(
           Audience.People(Set(owner.id, member.id)),
-          Set(team.id, school.id),
+          Set(team.id, company.id),
         )),
       )
 
   test("following a link to a resource changes its grants"):
     served: world =>
       for
-        (owner, _)  <- world.signUp("owner")
-        (_, cookie) <- world.signUp("reader")
-        code        <- world
+        owner  <- world.signUp("owner")
+        reader <- world.signUp("reader")
+        code   <- world
           .db
           .run(
             world
@@ -160,147 +155,87 @@ class AffectedSuite extends CatsEffectSuite:
                 LinkTarget.Sharing(book, Access.View),
               ),
           )
-        _    <- world.follow(cookie, code)
+        _    <- world.linking.follow(reader, code)
         told <- world.reported
       yield assertEquals(told, List(Affected.Grants(book)))
 
   test("a new password concerns the account's own sessions"):
     served: world =>
       for
-        (user, cookie) <- world.signUp("user")
-        _              <- world.changePassword(cookie)
-        told           <- world.reported
+        user <- world.signUp("user")
+        _    <- world
+          .auth
+          .changePassword(
+            user,
+            PasswordChange("hunter2222", "hunter3333"),
+          )
+        told <- world.reported
       yield assertEquals(told, List(Affected.Account(user.id)))
 
   test("a refused change concerns nobody"):
     served: world =>
       for
-        (owner, _)        <- world.signUp("owner")
-        (_, strangerSide) <- world.signUp("stranger")
-        club              <- world.groups.create(owner.id, GroupDraft("Club"))
-        _                 <- world.reported
-        _                 <- world.rename(
-          strangerSide,
-          club.id,
-          GroupDraft("Mine"),
+        owner    <- world.signUp("owner")
+        stranger <- world.signUp("stranger")
+        club     <- world.groups.create(owner.id, GroupDetails("Club"))
+        _        <- world.reported
+        refused <- world.service.update(stranger, club.id, GroupDetails("Mine"))
+        told    <- world.reported
+      yield
+        assert(
+          refused.isLeft,
+          "a stranger renamed someone else's group",
         )
-        told <- world.reported
-      yield assertEquals(told, List.empty)
+        assertEquals(told, List.empty)
 
 object AffectedSuite:
 
-  /** The one resource the tests' host application has, a book. */
   private val book = Resource("book", 1)
 
-  /**
-    * The stores and endpoints under test, over one fresh database, with what
-    * the services have reported so far and the means to act as the users the
-    * tests sign up.
-    */
   private final class World
     (
       val db: TestDb,
-      send: SendRequest,
+      val auth: AuthService,
+      val service: GroupService,
+      val linking: LinkService,
       told: Ref[IO, List[Affected]],
     ):
 
     val groups = GroupStore(TestDb.tables, db)
     val links  = LinkStore(TestDb.tables)
 
-    /** What has been reported since this was last asked, oldest first. */
+    /** Drains what has been reported, oldest first. */
     def reported: IO[List[Affected]] = told.getAndSet(Nil).map(_.reverse)
 
-    /** Registers a user, yielding them and their session cookie. */
-    def signUp(name: String): IO[(User, String)] = Fixtures.signUp(send, name)
+    def signUp(name: String): IO[User] = Fixtures.signUp(auth, name).map(_._1)
 
-    /**
-      * Invites a user to a group, straight through the store, and has them
-      * accept.
-      */
+    /** Enrols a member through the store, which reports nothing. */
     def join(owner: User, group: Long, member: User): IO[Unit] =
       enrol(groups, owner, group, member)
 
-    /** Follows a link as the user with the given session. */
-    def follow(cookie: String, code: String): IO[Unit] = send(
-      basicRequest
-        .post(uri"http://test/api/invite-links/$code")
-        .cookie(AuthApi.sessionCookie, cookie),
-    ).void
-
-    /** Leaves a group as the user with the given session. */
-    def leave(cookie: String, group: Long): IO[Unit] = send(
-      basicRequest
-        .delete(uri"http://test/api/groups/$group/membership")
-        .cookie(AuthApi.sessionCookie, cookie),
-    ).void
-
-    /** Renames or moves a group as the user with the given session. */
-    def rename
-      (
-        cookie: String,
-        group: Long,
-        draft: GroupDraft,
-      )
-      : IO[Unit] = send(
-      basicRequest
-        .put(uri"http://test/api/groups/$group")
-        .cookie(AuthApi.sessionCookie, cookie)
-        .body(draft.asJson.noSpaces),
-    ).void
-
-    /** Makes a group public or private as the user with the given session. */
-    def publish
-      (
-        cookie: String,
-        group: Long,
-        public: Boolean,
-      )
-      : IO[Unit] = send(
-      basicRequest
-        .put(uri"http://test/api/groups/$group/public")
-        .cookie(AuthApi.sessionCookie, cookie)
-        .body(public.asJson.noSpaces),
-    ).void
-
-    /** Deletes a group as the user with the given session. */
-    def delete(cookie: String, group: Long): IO[Unit] = send(
-      basicRequest
-        .delete(uri"http://test/api/groups/$group")
-        .cookie(AuthApi.sessionCookie, cookie),
-    ).void
-
-    /** Changes the password of the user with the given session. */
-    def changePassword(cookie: String): IO[Unit] = send(
-      basicRequest
-        .put(uri"http://test/api/auth/password")
-        .cookie(AuthApi.sessionCookie, cookie)
-        .body(PasswordChange("hunter2222", "hunter3333").asJson.noSpaces),
-    ).void
-
-  /** Runs a check against the endpoints and stores over a fresh database. */
   private def served(check: World => IO[Unit]): IO[Unit] = TestDb
-    .open(s"affected-${ java.util.UUID.randomUUID }")
+    .open("affected")
     .use: db =>
       for
         told <- Ref.of[IO, List[Affected]](Nil)
-        tell    = (affected: Affected) => told.update(affected :: _)
-        users   = UserStore(TestDb.tables, db)
-        auth    = AuthService(users, affected = tell)
-        groups  = GroupStore(TestDb.tables, db)
-        grants  = GrantStore(TestDb.tables, db)
-        service = GroupService(groups, auth, affected = tell)
-        links   = LinkService(
-          LinkStore(TestDb.tables),
-          groups,
-          grants,
-          db,
-          auth,
-          resource => DBIO.successful(Option.when(resource == book)("Dune")),
-          affected = tell,
-        )
+        tell   = (affected: Affected) => told.update(affected :: _)
+        groups = GroupStore(TestDb.tables, db)
         _ <- check(World(
           db,
-          serve(auth.api ++ service.api ++ links.api),
+          AuthService(
+            UserStore(TestDb.tables, db),
+            cheap,
+            affected = tell,
+          ),
+          GroupService(groups, affected = tell),
+          LinkService(
+            LinkStore(TestDb.tables),
+            groups,
+            GrantStore(TestDb.tables, db),
+            db,
+            resource => DBIO.successful(Option.when(resource == book)("Dune")),
+            affected = tell,
+          ),
           told,
         ))
       yield ()
