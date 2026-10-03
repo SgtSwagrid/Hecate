@@ -3,42 +3,47 @@ package server
 
 import cats.effect.IO
 import cats.syntax.all.*
-import com.alecdorrington.hecate.model.User
+import com.alecdorrington.hecate.model.{AuthRefusal, EmailStatus, User}
 import java.sql.SQLException
 import scala.util.{Failure, Success}
 
 /**
-  * The store of registered users, their sign-in sessions, and their recovery
-  * codes.
+  * A store of users, registered and guests, with their sessions, recovery
+  * codes, email addresses and emailed links.
+  *
+  * Usernames are stored as chosen but matched whatever their letter case
+  * ([[Username.key]]), so `Alice` signs in as `alice` and neither can be taken
+  * once the other is. Sessions, codes and links are stored only as hashes of
+  * their secrets.
   *
   * @param tables
-  *   The tables the users, sessions and codes are stored in.
+  *   The tables the users are stored in.
   *
   * @param db
-  *   The database to run the queries against.
+  *   The database to run queries against.
   */
 final class UserStore(tables: AuthTables, db: Transactor):
 
   import tables.profile.api.*
 
   /**
-    * Stores a new user under the given password hash, or returns `None` when
-    * the username is already taken.
+    * Stores a new user. The username's key column is unique, so the insert
+    * alone decides whether the name is free in any case; a check first would
+    * race.
     *
-    * Surrounding space is trimmed by the service before it arrives here, but
-    * nothing else is: the name is stored as given and matched exactly, letter
-    * case and all. A host wanting `Alice` and `alice` to be one account folds
-    * the case itself, before registering and before signing in.
+    * @param username
+    *   The username, already trimmed.
     *
-    * The username column is unique in the database itself, so the insert alone
-    * decides: checking first would not help, as two registrations racing for
-    * the same name could both find it free. Whichever inserts second is refused
-    * by the database, and that refusal is what reports the name as taken.
+    * @param passwordHash
+    *   The password's hash, as [[Passwords.hash]] makes it.
+    *
+    * @return
+    *   An effect producing the user, or `None` if the username is taken.
     */
   def register(username: String, passwordHash: String): IO[Option[User]] = db
     .run(
       (tables.users.returning(tables.users.map(_.id)) +=
-        UserRow(0, username, passwordHash))
+        UserRow(0, username, Some(passwordHash), None))
         .asTry
         .flatMap:
           case Success(id) => DBIO.successful(Some(User(id, username)))
@@ -47,17 +52,141 @@ final class UserStore(tables: AuthTables, db: Transactor):
           case Failure(error) => DBIO.failed(error),
     )
 
-  /** Finds one stored user by username, including their password hash. */
+  /**
+    * Makes a guest, runs `arrival` and opens the guest's session, all in one
+    * transaction, so nothing is made if `arrival` fails.
+    *
+    * The username is the name if free, or else the name with the lowest free
+    * number (`Sam 2`, `Sam 3`, ...). Guests of one name made at once may race
+    * for a number; the loser's transaction is retried a few times.
+    *
+    * @tparam X
+    *   The type of what `arrival` produces.
+    *
+    * @param name
+    *   The name the guest gave, trimmed.
+    *
+    * @param token
+    *   The token of the guest's session.
+    *
+    * @param expiresAt
+    *   The session's expiry, in milliseconds since the epoch.
+    *
+    * @param arrival
+    *   The action the guest was made for, run in the same transaction.
+    *
+    * @return
+    *   An effect producing the guest and what `arrival` produced.
+    */
+  def createGuest[X]
+    (
+      name: String,
+      token: String,
+      expiresAt: Long,
+    )
+    (arrival: User => DBIO[X])
+    : IO[(User, X)] =
+    val action = (for
+      taken <- tables
+        .users
+        .filter(row =>
+          row.usernameKey === Username.key(name) ||
+          row.usernameKey.startsWith(s"${ Username.key(name) } "),
+        )
+        .map(_.usernameKey)
+        .result
+      username = UserStore.numbered(name, taken.toSet)
+      id <- tables.users.returning(tables.users.map(_.id)) +=
+        UserRow(0, username, None, None)
+      guest = User(id, username, guest = true)
+      arrived <- arrival(guest)
+      _       <- tables.sessions += SessionRow(Digest.of(token), id, expiresAt)
+    yield guest -> arrived).transactionally
+    def withRetries(left: Int): IO[(User, X)] = db
+      .run(action)
+      .handleErrorWith:
+        case error if left > 1 && UserStore.violatesConstraint(error) =>
+          withRetries(left - 1)
+        case error => IO.raiseError(error)
+    withRetries(UserStore.guestTries)
+
+  /**
+    * Claims a guest's account with a username and password, closing its
+    * sessions and opening the given one. The user's row is locked, so two
+    * claims cannot both find a guest; the unique username key column decides
+    * whether the name is free in any case.
+    *
+    * @param user
+    *   The identifier of the guest.
+    *
+    * @param username
+    *   The username chosen, already trimmed.
+    *
+    * @param passwordHash
+    *   The password's hash.
+    *
+    * @param token
+    *   The token of the new session.
+    *
+    * @param expiresAt
+    *   The session's expiry, in milliseconds since the epoch.
+    *
+    * @return
+    *   An effect producing the claimed user, or [[AuthRefusal.NotGuest]] for an
+    *   account with a password or none at all, or
+    *   [[AuthRefusal.UsernameTaken]].
+    */
+  def claim
+    (
+      user: Long,
+      username: String,
+      passwordHash: String,
+      token: String,
+      expiresAt: Long,
+    )
+    : IO[Either[AuthRefusal, User]] = db.run(
+    (for
+      held <- tables.lockUser(user)
+      _    <- refuseUnless(
+        held.exists(_.passwordHash.isEmpty),
+        AuthRefusal.NotGuest,
+      )
+      _ <- byId(user)
+        .map(row => (row.username, row.usernameKey))
+        .update((username, Username.key(username)))
+      _ <- reset(user, passwordHash, token, expiresAt)
+    yield User(user, username))
+      .transactionally
+      .asTry
+      .flatMap:
+        case Success(claimed)              => DBIO.successful(Right(claimed))
+        case Failure(AuthProblem(refusal)) => DBIO.successful(Left(refusal))
+        case Failure(error) if UserStore.violatesConstraint(error) =>
+          DBIO.successful(Left(AuthRefusal.UsernameTaken))
+        case Failure(error) => DBIO.failed(error),
+  )
+
+  /**
+    * Finds a user by username, whatever its letter case.
+    *
+    * @param username
+    *   The username, already trimmed.
+    *
+    * @return
+    *   An effect producing the user's row, password hash included, or `None`.
+    */
   def findByUsername(username: String): IO[Option[UserRow]] =
     db.run(byUsername(username).result.headOption)
 
   /**
-    * The users with the given identifiers, keyed by identifier; an identifier
-    * with no user is simply absent. One query, and no empty query at all.
+    * Finds users by identifier, with no check of who may see whom: the host
+    * must decide that first, and never expose this directly.
     *
-    * A raw lookup, with no notion of who may see whom. A host application must
-    * decide which of these users the caller may see before calling this, and
-    * must never expose it directly, or it becomes a directory of every account.
+    * @param ids
+    *   The identifiers of the users.
+    *
+    * @return
+    *   An effect producing each found user keyed by identifier.
     */
   def byIds(ids: Seq[Long]): IO[Map[Long, User]] = db.run(
     ifAny(ids.distinct)(Map.empty)(found =>
@@ -69,33 +198,62 @@ final class UserStore(tables: AuthTables, db: Transactor):
     ),
   )
 
-  /** Finds one stored user by identifier, including their password hash. */
-  def findById(user: Long): IO[Option[UserRow]] =
+  /**
+    * Finds a user by identifier.
+    *
+    * @param user
+    *   The identifier of the user.
+    *
+    * @return
+    *   An effect producing the user's row, password hash included, or `None`.
+    */
+  def find(user: Long): IO[Option[UserRow]] =
     db.run(byId(user).result.headOption)
 
   /**
-    * Opens a sign-in session for the given user under the given token, expiring
-    * at the given time. Only the hash of the token is stored, so that a stolen
-    * copy of the table is not a set of usable sessions.
+    * Opens a sign-in session.
+    *
+    * @param token
+    *   The session's secret token, stored only as its hash.
+    *
+    * @param user
+    *   The identifier of the user.
+    *
+    * @param expiresAt
+    *   The session's expiry, in milliseconds since the epoch.
     */
-  def openSession(token: String, user: Long, expires: Long): IO[Unit] = db
-    .run(tables.sessions += SessionRow(Digest.of(token), user, expires))
+  def openSession(token: String, user: Long, expiresAt: Long): IO[Unit] = db
+    .run(tables.sessions += SessionRow(Digest.of(token), user, expiresAt))
     .void
 
   /**
-    * Deletes every session that has expired, whoever it belonged to. Nothing
-    * here calls this: an expired session is refused by [[sessionUser]] whether
-    * or not its row is still there, so this is housekeeping, and a host
-    * application schedules it as it sees fit rather than paying for it inside
-    * somebody else's request.
+    * Deletes every expired session and emailed link, and every record of a mail
+    * sent a day ago or more. Nothing in the library calls this: expired rows
+    * are refused anyway, so the host schedules it as housekeeping.
     */
   def purgeExpired: IO[Unit] = IO
     .realTime
     .flatMap(now =>
-      db.run(tables.sessions.filter(_.expires <= now.toMillis).delete).void,
+      db.run(DBIO.seq(
+        tables.sessions.filter(_.expiresAt <= now.toMillis).delete,
+        tables.emailLinks.filter(_.expiresAt <= now.toMillis).delete,
+        tables
+          .sentMails
+          .filter(_.sentAt <= now.toMillis - UserStore.dayMillis)
+          .delete,
+      )),
     )
 
-  /** The user signed in under the given session token, if it has not expired. */
+  /**
+    * Finds the user signed in under a session token.
+    *
+    * @param token
+    *   The session's token.
+    *
+    * @return
+    *   An effect producing the user, or `None` if the session is missing or
+    *   expired.
+    */
   def sessionUser(token: String): IO[Option[User]] = IO
     .realTime
     .flatMap(now =>
@@ -104,7 +262,7 @@ final class UserStore(tables: AuthTables, db: Transactor):
           .sessions
           .filter(session =>
             session.tokenHash === Digest.of(token) &&
-            session.expires > now.toMillis,
+            session.expiresAt > now.toMillis,
           )
           .join(tables.users)
           .on(_.userId === _.id)
@@ -115,32 +273,64 @@ final class UserStore(tables: AuthTables, db: Transactor):
     )
     .map(_.map(_.toUser))
 
-  /** Closes the session with the given token, signing its user out. */
+  /**
+    * Closes a session.
+    *
+    * @param token
+    *   The session's token.
+    */
   def closeSession(token: String): IO[Unit] = db
     .run(tables.sessions.filter(_.tokenHash === Digest.of(token)).delete)
     .void
 
   /**
-    * Replaces the given user's password, signing out every session they had and
-    * opening the one given in their place, so that whoever knew the old
-    * password is signed out along with them.
+    * Replaces a user's password, closing every session and emailed link and
+    * opening the given session.
+    *
+    * @param user
+    *   The identifier of the user.
+    *
+    * @param passwordHash
+    *   The new password's hash.
+    *
+    * @param token
+    *   The token of the new session.
+    *
+    * @param expiresAt
+    *   The session's expiry, in milliseconds since the epoch.
     */
   def resetPassword
     (
       user: Long,
       passwordHash: String,
       token: String,
-      expires: Long,
+      expiresAt: Long,
     )
     : IO[Unit] =
-    db.run(reset(user, passwordHash, token, expires).transactionally)
+    db.run(reset(user, passwordHash, token, expiresAt).transactionally)
 
   /**
-    * Regains the account with the given username using one of its recovery
-    * codes: uses the code up, then resets the password as [[resetPassword]]
-    * does. Returns the user, or `None`, changing nothing, when there is no such
-    * account or the code is not one of its unused codes. The two cases are not
-    * told apart, so that this cannot be used to find usernames.
+    * Regains an account with a recovery code, using the code up and resetting
+    * the password as [[resetPassword]] does. A missing account and a wrong code
+    * are answered alike, so usernames cannot be discovered.
+    *
+    * @param username
+    *   The account's username.
+    *
+    * @param codeHash
+    *   The code's hash, as [[RecoveryCode.hash]] makes it.
+    *
+    * @param passwordHash
+    *   The new password's hash.
+    *
+    * @param token
+    *   The token of the new session.
+    *
+    * @param expiresAt
+    *   The session's expiry, in milliseconds since the epoch.
+    *
+    * @return
+    *   An effect producing the user, or `None`, changing nothing.
     */
   def recover
     (
@@ -148,47 +338,53 @@ final class UserStore(tables: AuthTables, db: Transactor):
       codeHash: String,
       passwordHash: String,
       token: String,
-      expires: Long,
+      expiresAt: Long,
     )
     : IO[Option[User]] = db.run(
     byUsername(username)
       .result
       .headOption
-      .flatMap(regain(_, codeHash, passwordHash, token, expires))
+      .flatMap(regain(
+        _,
+        codeHash,
+        passwordHash,
+        token,
+        expiresAt,
+      ))
       .transactionally,
   )
 
-  /**
-    * Regains the given account, if there is one and the code is one of its
-    * unused codes, and answers with nobody otherwise.
-    */
   private def regain
     (
       found: Option[UserRow],
       codeHash: String,
       passwordHash: String,
       token: String,
-      expires: Long,
+      expiresAt: Long,
     )
     : DBIO[Option[User]] = found.fold(DBIO.successful(None))(row =>
-    claim(row.id, codeHash).flatMap(claimed =>
-      if claimed then
-        reset(row.id, passwordHash, token, expires).map(_ => Some(row.toUser))
+    consumeCode(row.id, codeHash).flatMap(used =>
+      if used then
+        reset(row.id, passwordHash, token, expiresAt).map(_ => Some(row.toUser))
       else DBIO.successful(None),
     ),
   )
 
   /**
-    * Uses up one of a user's recovery codes, answering whether it was one of
-    * theirs. Deleting it both checks it and claims it in one step, so that two
-    * recoveries racing with the same code cannot both succeed.
+    * Uses up a recovery code. Deleting it checks and consumes it in one step,
+    * so two racing recoveries cannot both succeed.
     */
-  private def claim(user: Long, codeHash: String): DBIO[Boolean] =
+  private def consumeCode(user: Long, codeHash: String): DBIO[Boolean] =
     codeOf(user, codeHash).delete.map(_ == 1)
 
   /**
-    * Replaces every recovery code of the given user with the given set, so that
-    * any code written down before stops working.
+    * Replaces every recovery code of a user.
+    *
+    * @param user
+    *   The identifier of the user.
+    *
+    * @param codeHashes
+    *   The new codes' hashes.
     */
   def replaceRecoveryCodes(user: Long, codeHashes: Seq[String]): IO[Unit] = db
     .run(
@@ -200,71 +396,352 @@ final class UserStore(tables: AuthTables, db: Transactor):
         .transactionally,
     )
 
-  /** How many unused recovery codes the given user has left. */
+  /**
+    * Counts a user's unused recovery codes.
+    *
+    * @param user
+    *   The identifier of the user.
+    *
+    * @return
+    *   An effect producing the count.
+    */
   def recoveryCodesLeft(user: Long): IO[Int] =
     db.run(codesOf(user).length.result)
 
-  /**
-    * Replaces one user's password hash, leaving their sessions alone: the
-    * password itself has not changed, only the cost it is stored under, so
-    * nobody need be signed out.
-    */
+  /** Replaces a password hash with one of more iterations, keeping sessions. */
   private[server] def rehash(user: Long, passwordHash: String): IO[Unit] = db
-    .run(byId(user).map(_.passwordHash).update(passwordHash))
+    .run(byId(user).map(_.passwordHash).update(Some(passwordHash)))
     .void
 
   /**
-    * Removes one user's sessions, recovery codes and account. Composes into an
-    * account's deletion, which removes everything else of theirs first.
+    * Finds the users with a confirmed address.
+    *
+    * @param address
+    *   The address, normalised.
+    *
+    * @return
+    *   An effect producing the users.
     */
-  private[server] def remove(user: Long): DBIO[Unit] = DBIO.seq(
+  def withEmail(address: String): IO[Seq[User]] = db
+    .run(tables.users.filter(_.email === address).result)
+    .map(_.map(_.toUser))
+
+  /**
+    * Reads a user's confirmed address and any address awaiting confirmation.
+    *
+    * @param user
+    *   The identifier of the user.
+    *
+    * @param now
+    *   The current time, in milliseconds since the epoch.
+    *
+    * @return
+    *   An effect producing the addresses.
+    */
+  def emailStatus(user: Long, now: Long): IO[EmailStatus] = db.run(
+    for
+      address <- byId(user).map(_.email).result.headOption
+      pending <- linksOf(user, EmailPurpose.Confirm)
+        .filter(_.expiresAt > now)
+        .map(_.address)
+        .result
+        .headOption
+    yield EmailStatus(address.flatten, pending),
+  )
+
+  /**
+    * Stores a link about to be mailed and records the mail as sent, unless: a
+    * mail of the same purpose was sent to the user after `since`; `perAddress`
+    * or more mails went to the address in the past hour; a reset is for an
+    * address no longer the user's; or the user no longer exists.
+    *
+    * A confirmation replaces earlier confirmations; a reset replaces nothing,
+    * so a link already mailed keeps working. The mail counts as sent whether or
+    * not it is delivered. The user's row is locked, so two requests for one
+    * user cannot both pass; requests for different users may still overshoot
+    * one address's limit by how many arrive at once.
+    *
+    * @param link
+    *   The link to store.
+    *
+    * @param since
+    *   The time after which an earlier mail of the same purpose blocks this
+    *   one, in milliseconds since the epoch.
+    *
+    * @param perAddress
+    *   The most mails one address may receive in an hour.
+    *
+    * @return
+    *   An effect producing whether the link was stored and may be sent.
+    */
+  def issueLink
+    (
+      link: EmailLinkRow,
+      since: Long,
+      perAddress: Int,
+    )
+    : IO[Boolean] = db.run(
+    (
+      for
+        held   <- tables.lockUser(link.userId)
+        toUser <- tables
+          .sentMails
+          .filter(mail =>
+            mail.userId === link.userId && mail.purpose === link.purpose &&
+            mail.sentAt > since,
+          )
+          .exists
+          .result
+        toAddress <- tables
+          .sentMails
+          .filter(mail =>
+            mail.address === link.address &&
+            mail.sentAt > link.sentAt - AuthPolicy.hourMillis,
+          )
+          .length
+          .result
+        issued = held.exists(mayReceive(_, link)) && !toUser &&
+          toAddress < perAddress
+        _ <-
+          if issued then
+            DBIO.seq(
+              deleteReplaced(link),
+              tables.emailLinks += link,
+              tables.sentMails += SentMailRow(
+                0,
+                link.userId,
+                link.purpose,
+                link.address,
+                link.sentAt,
+              ),
+            )
+          else DBIO.unit
+      yield issued
+    ).transactionally,
+  )
+
+  /**
+    * Deletes a link whose mail could not be sent. The mail still counts as sent
+    * (see [[issueLink]]).
+    *
+    * @param tokenHash
+    *   The hash of the link's secret.
+    */
+  def withdrawLink(tokenHash: String): IO[Unit] = db
+    .run(tables.emailLinks.filter(_.tokenHash === tokenHash).delete)
+    .void
+
+  /**
+    * Resets a password with an emailed link, using the link up and setting the
+    * password as [[resetPassword]] does.
+    *
+    * @param tokenHash
+    *   The hash of the link's secret.
+    *
+    * @param passwordHash
+    *   The new password's hash.
+    *
+    * @param token
+    *   The token of the new session.
+    *
+    * @param expiresAt
+    *   The session's expiry, in milliseconds since the epoch.
+    *
+    * @param now
+    *   The current time, in milliseconds since the epoch.
+    *
+    * @return
+    *   An effect producing the user, or `None`, changing nothing, if the link
+    *   does not work.
+    */
+  def resetByLink
+    (
+      tokenHash: String,
+      passwordHash: String,
+      token: String,
+      expiresAt: Long,
+      now: Long,
+    )
+    : IO[Option[User]] = db.run((for
+    used <- consumeLink(tokenHash, EmailPurpose.Reset, now)
+    _    <- used.fold[DBIO[Unit]](DBIO.unit)((_, row) =>
+      reset(row.id, passwordHash, token, expiresAt),
+    )
+  yield used.map(_._2.toUser)).transactionally)
+
+  /**
+    * Confirms an address with the link sent to it, using the link up, making
+    * the address its user's and withdrawing every other link sent them, so a
+    * reset link mailed to the old address stops working.
+    *
+    * @param tokenHash
+    *   The hash of the link's secret.
+    *
+    * @param now
+    *   The current time, in milliseconds since the epoch.
+    *
+    * @return
+    *   An effect producing the user and the address replaced, if any, or
+    *   `None`, changing nothing, if the link does not work.
+    */
+  def confirmByLink
+    (tokenHash: String, now: Long)
+    : IO[Option[(User, Option[String])]] = db.run(
+    (for
+      used <- consumeLink(tokenHash, EmailPurpose.Confirm, now)
+      _    <- used.fold[DBIO[Unit]](DBIO.unit)((link, row) =>
+        DBIO.seq(
+          byId(row.id).map(_.email).update(Some(link.address)),
+          allLinksOf(row.id).delete,
+        ),
+      )
+    yield used.map((link, row) =>
+      (row.toUser, row.email.filterNot(_ == link.address)),
+    )).transactionally,
+  )
+
+  /**
+    * Removes a user's address and withdraws every link sent them.
+    *
+    * @param user
+    *   The identifier of the user.
+    *
+    * @return
+    *   An effect producing the address removed, if any.
+    */
+  def removeEmail(user: Long): IO[Option[String]] = db.run((for
+    held <- tables.lockUser(user)
+    _    <- DBIO.seq(
+      byId(user).map(_.email).update(None),
+      allLinksOf(user).delete,
+    )
+  yield held.flatMap(_.email)).transactionally)
+
+  /**
+    * Withdraws a user's pending address confirmation.
+    *
+    * @param user
+    *   The identifier of the user.
+    */
+  def withdrawConfirmation(user: Long): IO[Unit] = db
+    .run(linksOf(user, EmailPurpose.Confirm).delete)
+    .void
+
+  /**
+    * Deletes a user's sessions, codes, links and row, for an account's
+    * deletion. Records of mails sent stay for a day, so deleting accounts
+    * cannot lift an address's mail limit.
+    */
+  private[server] def delete(user: Long): DBIO[Unit] = DBIO.seq(
     sessionsOf(user).delete,
     codesOf(user).delete,
+    allLinksOf(user).delete,
     byId(user).delete,
   )
 
-  /** Sets a password, closing every session and opening the given one. */
+  /**
+    * Sets a password, replacing every session with the given one and
+    * withdrawing every emailed link, so no old reset or confirmation link can
+    * undo the change.
+    */
   private def reset
     (
       user: Long,
       passwordHash: String,
       token: String,
-      expires: Long,
+      expiresAt: Long,
     )
     : DBIO[Unit] = DBIO.seq(
-    byId(user).map(_.passwordHash).update(passwordHash),
+    byId(user).map(_.passwordHash).update(Some(passwordHash)),
     sessionsOf(user).delete,
-    tables.sessions += SessionRow(Digest.of(token), user, expires),
+    allLinksOf(user).delete,
+    tables.sessions += SessionRow(Digest.of(token), user, expiresAt),
   )
 
-  /** The query for the stored user with the given identifier. */
+  /** Whether a link may go to the user: a reset only to their current address. */
+  private def mayReceive(row: UserRow, link: EmailLinkRow): Boolean =
+    link.purpose != EmailPurpose.Reset.code || row.email.contains(link.address)
+
+  private def deleteReplaced(link: EmailLinkRow): DBIO[Unit] =
+    if link.purpose == EmailPurpose.Confirm.code then
+      linksOf(link.userId, EmailPurpose.Confirm).delete.unit
+    else DBIO.unit
+
+  /**
+    * Uses up a working link of the given purpose. Deleting it checks and
+    * consumes it in one step, so two racing requests cannot both succeed. The
+    * user's row is locked before the link, the order [[issueLink]] and
+    * [[removeEmail]] take, so they cannot deadlock.
+    */
+  private def consumeLink
+    (
+      tokenHash: String,
+      purpose: EmailPurpose,
+      now: Long,
+    )
+    : DBIO[Option[(EmailLinkRow, UserRow)]] =
+    val link = tables.emailLinks.filter(_.tokenHash === tokenHash)
+    link
+      .filter(row => row.purpose === purpose.code && row.expiresAt > now)
+      .result
+      .headOption
+      .flatMap(
+        _.fold[DBIO[Option[(EmailLinkRow, UserRow)]]](DBIO.successful(None))(
+          row =>
+            tables
+              .lockUser(row.userId)
+              .flatMap(owner =>
+                link
+                  .delete
+                  .map(deleted => Option.when(deleted == 1)(row).zip(owner)),
+              ),
+        ),
+      )
+
   private def byId(user: Long) = tables.users.filter(_.id === user)
 
-  /** The query for the stored user with the given username. */
   private def byUsername(username: String) = tables
     .users
-    .filter(_.username === username)
+    .filter(_.usernameKey === Username.key(username))
 
-  /** The query for every session of the given user. */
   private def sessionsOf(user: Long) = tables.sessions.filter(_.userId === user)
 
-  /** The query for every unused recovery code of the given user. */
   private def codesOf(user: Long) = tables
     .recoveryCodes
     .filter(_.userId === user)
 
-  /** The query for one unused recovery code of the given user, by its hash. */
   private def codeOf(user: Long, codeHash: String) =
     codesOf(user).filter(_.codeHash === codeHash)
 
+  private def allLinksOf(user: Long) = tables
+    .emailLinks
+    .filter(_.userId === user)
+
+  private def linksOf(user: Long, purpose: EmailPurpose) = allLinksOf(user)
+    .filter(_.purpose === purpose.code)
+
 object UserStore:
 
+  /** The number of milliseconds in a day, as long as sent mails are recorded. */
+  private val dayMillis: Long = 24 * AuthPolicy.hourMillis
+
+  /** The number of tries to make a guest when others take its number. */
+  private val guestTries = 5
+
   /**
-    * Whether a failure is the database refusing a write that would break an
-    * integrity constraint, such as a second user with the same username.
-    * Recognised by its standard SQLSTATE class, `23`, rather than by any one
-    * driver's exception type, as drivers differ: H2 raises a dedicated
-    * subclass, whereas PostgreSQL's driver reports it only through the state.
+    * The name if free, or else the name with the lowest free number from 2,
+    * `taken` holding the keys of the usernames taken.
+    */
+  private[server] def numbered(name: String, taken: Set[String]): String =
+    Iterator
+      .from(1)
+      .map(number => if number == 1 then name else s"$name $number")
+      .find(candidate => !taken(Username.key(candidate)))
+      .get
+
+  /**
+    * Whether a failure is an integrity constraint violation, recognised by
+    * SQLSTATE class `23`, as drivers differ in their exception types.
     */
   private def violatesConstraint(error: Throwable): Boolean = error match
     case sql: SQLException => Option(sql.getSQLState).exists(_.startsWith("23"))

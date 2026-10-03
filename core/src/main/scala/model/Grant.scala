@@ -4,8 +4,8 @@ package model
 import io.circe.Codec
 
 /**
-  * One principal's access to one resource, as stored. A user's access to a
-  * resource is the highest level among the grants that reach them.
+  * A principal's access to a resource, as stored. A user's access to a resource
+  * is the highest level among the grants that reach them.
   *
   * @param resource
   *   The resource that access is granted over.

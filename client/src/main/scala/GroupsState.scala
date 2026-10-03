@@ -3,7 +3,7 @@ package client
 
 import com.alecdorrington.hecate.i18n.Wording
 import com.alecdorrington.hecate.model.{
-  GroupDraft, GroupView, Invitation, Invite, Joinable, Membership, User,
+  GroupDetails, Invitation, Invitee, JoinableGroup, Membership, OwnedGroup, User,
 }
 import com.raquo.laminar.api.L.*
 import io.circe.Decoder
@@ -12,24 +12,17 @@ import io.laminext.fetch.circe.*
 import scala.concurrent.ExecutionContext.Implicits.global
 
 /**
-  * The browser-side state of the signed-in user's groups, driving the endpoints
-  * of [[com.alecdorrington.hecate.api.GroupApi]]: the groups they own, the
-  * groups they belong to, the invitations they have been sent, and the groups
-  * they may ask to join. The server returns groups as a flat list; [[forest]]
-  * restores the nesting.
-  *
-  * Every command refetches on completion, and everything refetches whenever the
-  * signed-in user changes, so a sign-out empties it and a sign-in fills it. A
-  * refused request (as a signed-out viewer's will be) leaves a list empty
-  * rather than raising.
+  * A browser-side store of the signed-in user's groups, memberships,
+  * invitations and joinable groups, driving the endpoints under `/api/groups`
+  * and `/api/invitations`. Every command refetches the lists, as does any
+  * change of signed-in user, and a refused read leaves its list empty.
   *
   * @param auth
-  *   The sign-in state whose user these groups belong to.
+  *   The sign-in state whose user the groups belong to.
   *
   * @param wording
-  *   What this state says itself, in the language the host shows. The server's
-  *   refusals arrive already worded, in the language of the `language` cookie
-  *   the host sets.
+  *   The wording of this state's own messages. The server's refusals arrive
+  *   already worded.
   */
 final class GroupsState
   (
@@ -37,189 +30,232 @@ final class GroupsState
     wording: Wording = Wording.english,
   ):
 
-  /**
-    * Everything here is bound to the page rather than to a view, since this
-    * state outlives any one view and every request it makes must arrive whether
-    * or not something is on screen to receive it.
-    */
+  // Bound to the page, not a view, so that every request arrives whether or not
+  // anything is on screen.
   private given Owner = unsafeWindowOwner
-
-  private val groupsVar: Var[List[GroupView]] = Var(List.empty)
-
-  private val joinedVar: Var[List[Membership]] = Var(List.empty)
-
-  private val invitationsVar: Var[List[Invitation]] = Var(List.empty)
-
-  private val joinableVar: Var[List[Joinable]] = Var(List.empty)
 
   private val errorVar: Var[Option[String]] = Var(None)
 
   private val pendingVar: Var[Boolean] = Var(false)
 
-  /**
-    * Every group owned by the signed-in user, with its direct members and
-    * invitees.
-    */
-  val groups: Signal[List[GroupView]] = groupsVar.signal
+  private val refreshes = new EventBus[Unit]
 
-  /**
-    * The signed-in user's groups, nested by [[Group.parent]], with siblings
-    * ordered by name.
-    */
-  val forest: Signal[List[GroupTree]] = groupsVar.signal.map(GroupsState.nest)
+  private val userId: Signal[Option[Long]] = auth.userId
 
-  /**
-    * The groups the signed-in user is a member of but does not own, each with
-    * its manager and everyone in it. Their own groups are not repeated here.
-    */
-  val memberships: Signal[List[Membership]] = joinedVar
-    .signal
-    .combineWith(groupsVar.signal)
-    .mapN((mine, owned) =>
-      mine.filterNot(joined => owned.exists(_.group.id == joined.group.id)),
-    )
+  /** The groups the signed-in user owns, as a flat list. */
+  val owned: Signal[List[OwnedGroup]] = listed[OwnedGroup]("/api/groups")
+
+  /** The groups the signed-in user owns, nested, siblings ordered by name. */
+  val forest: Signal[List[GroupTree]] = owned.map(GroupsState.nest)
+
+  /** The groups the signed-in user is a member of but does not own. */
+  val memberships: Signal[List[Membership]] =
+    listed[Membership]("/api/groups/mine")
+      .combineWith(owned)
+      .mapN: (mine, owns) =>
+        val ownedIds = owns.map(_.group.id).toSet
+        mine.filterNot(joined => ownedIds(joined.group.id))
 
   /** The pending invitations sent to the signed-in user. */
-  val invitations: Signal[List[Invitation]] = invitationsVar.signal
+  val invitations: Signal[List[Invitation]] =
+    listed[Invitation]("/api/invitations")
 
   /**
-    * The groups the signed-in user may ask to join, and those they have asked
-    * to join, ordered by name.
+    * The groups the signed-in user may ask to join or has asked to join,
+    * ordered by name.
     */
-  val joinable: Signal[List[Joinable]] = joinableVar.signal
+  val joinable: Signal[List[JoinableGroup]] =
+    listed[JoinableGroup]("/api/groups/joinable")
 
-  /**
-    * How many requests to join the signed-in user's groups await their answer,
-    * across every group they own.
-    */
-  val requests: Signal[Int] = groupsVar.signal.map(_.map(_.applicants.size).sum)
+  /** The number of requests to join the signed-in user's groups. */
+  val requestCount: Signal[Int] = owned.map(_.map(_.applicants.size).sum)
 
   /** The reason the last command was refused, if any. */
   val error: Signal[Option[String]] = errorVar.signal
 
-  /**
-    * Whether a command is in flight, for a view that disables its buttons while
-    * one is. Only commands count: the refetching that follows one, and the
-    * refetching a sign-in sets off, are nobody's to wait for.
-    */
+  /** Whether a command is in flight. Refetches do not count. */
   val pending: Signal[Boolean] = pendingVar.signal
 
-  // The lists belong to whoever is signed in, so they follow them: fetched for
-  // each user as they sign in, including one signed in already when this state
-  // is built (a signal, not its changes, so that a fresh page load with a live
-  // session still loads them), and emptied when they sign out.
-  locally:
-    auth
-      .user
-      .map(_.map(_.id))
-      .distinct
-      .foreach(user => if user.isDefined then refresh() else clear())
-
-  /** Empties every list, as nobody is signed in to own them. */
-  private def clear(): Unit =
-    groupsVar.set(List.empty)
-    joinedVar.set(List.empty)
-    invitationsVar.set(List.empty)
-    joinableVar.set(List.empty)
-
   /** Refetches every list, emptying those whose requests are refused. */
-  def refresh(): Unit =
-    fetch[GroupView]("/api/groups", groupsVar)
-    fetch[Membership]("/api/groups/mine", joinedVar)
-    fetch[Invitation]("/api/invitations", invitationsVar)
-    fetch[Joinable]("/api/groups/joinable", joinableVar)
+  def refresh(): Unit = refreshes.emit(())
 
-  /** Creates a group, nested under the given parent when there is one. */
-  def create(name: String, parent: Option[Long] = None): Unit = command(
+  /**
+    * Creates a group.
+    *
+    * @param name
+    *   The name of the group.
+    *
+    * @param parent
+    *   The identifier of the group to nest it inside, or `None` for the top
+    *   level.
+    */
+  def create(name: String, parent: Option[Long] = None): Unit = perform(
     Fetch
       .post(
         "/api/groups",
-        body = GroupDraft(name, parent),
+        body = GroupDetails(name, parent),
       )
       .text,
   )
 
   /**
-    * Renames one group, leaving its place in the hierarchy alone.
+    * Renames a group, leaving its place in the hierarchy alone.
+    *
+    * @param group
+    *   The group to rename.
+    *
+    * @param name
+    *   The new name.
     *
     * @param refused
-    *   Called with the reason, should this rename be refused, and only for this
-    *   rename: a view editing the name can restore it without being disturbed
-    *   by some other command's failure.
+    *   The callback given the reason if this rename, and not another command,
+    *   is refused.
     */
   def rename
     (
-      group: GroupView,
+      group: OwnedGroup,
       name: String,
       refused: String => Unit = _ => (),
     )
-    : Unit = command(
-    save(
+    : Unit = perform(
+    update(
       group.group.id,
-      GroupDraft(name, group.group.parent),
+      GroupDetails(name, group.group.parentId),
     ),
     refused,
   )
 
-  /** Moves one group under the given parent, or to the top level. */
-  def move(group: GroupView, parent: Option[Long]): Unit = command(save(
+  /**
+    * Moves a group inside another, or to the top level.
+    *
+    * @param group
+    *   The group to move.
+    *
+    * @param parent
+    *   The identifier of the new parent, or `None` for the top level.
+    */
+  def move(group: OwnedGroup, parent: Option[Long]): Unit = perform(update(
     group.group.id,
-    GroupDraft(group.group.name, parent),
+    GroupDetails(group.group.name, parent),
   ))
 
-  /** Deletes one group, together with every group nested beneath it. */
-  def delete(id: Long): Unit = command(Fetch.delete(s"/api/groups/$id").text)
+  /**
+    * Deletes a group and every group nested inside it.
+    *
+    * @param group
+    *   The identifier of the group.
+    */
+  def delete(group: Long): Unit =
+    perform(Fetch.delete(s"/api/groups/$group").text)
 
-  /** Invites the user with the given username to one group. */
-  def invite(group: Long, username: String): Unit = command(
+  /**
+    * Invites a user to a group.
+    *
+    * @param group
+    *   The identifier of the group.
+    *
+    * @param username
+    *   The username of the user to invite.
+    */
+  def invite(group: Long, username: String): Unit = perform(
     Fetch
       .post(
         s"/api/groups/$group/invitations",
-        body = Invite(username),
+        body = Invitee(username),
       )
       .text,
   )
 
   /**
-    * Removes one member from a group, cancels one pending invitation, or
-    * declines one request to join.
+    * Removes a member from a group, cancels their invitation, or declines their
+    * request to join.
+    *
+    * @param group
+    *   The identifier of the group.
+    *
+    * @param person
+    *   The identifier of the person.
     */
-  def withdraw(group: Long, user: Long): Unit =
-    command(Fetch.delete(s"/api/groups/$group/members/$user").text)
-
-  /** Accepts one invitation, joining its group. */
-  def accept(invitation: Long): Unit =
-    command(Fetch.post(s"/api/invitations/$invitation/accept").text)
-
-  /** Declines one invitation, deleting it. */
-  def decline(invitation: Long): Unit =
-    command(Fetch.post(s"/api/invitations/$invitation/decline").text)
-
-  /** Withdraws the signed-in user from a group they belong to. */
-  def leave(group: Long): Unit =
-    command(Fetch.delete(s"/api/groups/$group/membership").text)
-
-  /** Makes the signed-in user a member of a group they own. */
-  def join(group: Long): Unit =
-    command(Fetch.put(s"/api/groups/$group/membership").text)
+  def remove(group: Long, person: Long): Unit =
+    perform(Fetch.delete(s"/api/groups/$group/members/$person").text)
 
   /**
-    * Asks to join a group, for its owner to answer. Joins at once a group the
-    * user is invited to, or owns.
+    * Accepts an invitation, joining its group.
+    *
+    * @param invitation
+    *   The identifier of the invitation.
+    */
+  def accept(invitation: Long): Unit =
+    perform(Fetch.post(s"/api/invitations/$invitation/accept").text)
+
+  /**
+    * Declines an invitation, deleting it.
+    *
+    * @param invitation
+    *   The identifier of the invitation.
+    */
+  def decline(invitation: Long): Unit =
+    perform(Fetch.post(s"/api/invitations/$invitation/decline").text)
+
+  /**
+    * Withdraws the signed-in user from a group.
+    *
+    * @param group
+    *   The identifier of the group.
+    */
+  def leave(group: Long): Unit =
+    perform(Fetch.delete(s"/api/groups/$group/membership").text)
+
+  /**
+    * Makes the signed-in user a member of a group they own.
+    *
+    * @param group
+    *   The identifier of the group.
+    */
+  def join(group: Long): Unit =
+    perform(Fetch.put(s"/api/groups/$group/membership").text)
+
+  /**
+    * Asks to join a group. Joins at once a group the user is invited to or
+    * owns.
+    *
+    * @param group
+    *   The identifier of the group.
     */
   def request(group: Long): Unit =
-    command(Fetch.put(s"/api/groups/$group/request").text)
+    perform(Fetch.put(s"/api/groups/$group/request").text)
 
-  /** Withdraws the signed-in user's request to join a group. */
-  def retract(group: Long): Unit =
-    command(Fetch.delete(s"/api/groups/$group/request").text)
+  /**
+    * Withdraws the signed-in user's request to join a group.
+    *
+    * @param group
+    *   The identifier of the group.
+    */
+  def withdraw(group: Long): Unit =
+    perform(Fetch.delete(s"/api/groups/$group/request").text)
 
-  /** Admits to one of the user's groups someone who has asked to join it. */
-  def admit(group: Long, user: Long): Unit =
-    command(Fetch.put(s"/api/groups/$group/members/$user").text)
+  /**
+    * Admits to a group someone who has asked to join it.
+    *
+    * @param group
+    *   The identifier of the group.
+    *
+    * @param person
+    *   The identifier of the person.
+    */
+  def admit(group: Long, person: Long): Unit =
+    perform(Fetch.put(s"/api/groups/$group/members/$person").text)
 
-  /** Makes one of the user's groups public, or private again. */
-  def publish(group: Long, public: Boolean): Unit = command(
+  /**
+    * Makes a group public, or private again.
+    *
+    * @param group
+    *   The identifier of the group.
+    *
+    * @param public
+    *   Whether the group is to be public.
+    */
+  def setPublic(group: Long, public: Boolean): Unit = perform(
     Fetch
       .put(
         s"/api/groups/$group/public",
@@ -228,98 +264,95 @@ final class GroupsState
       .text,
   )
 
-  /** Gives one of the user's groups an invite link, unless it has one. */
+  /**
+    * Gives a group an invite link unless it has one.
+    *
+    * @param group
+    *   The identifier of the group.
+    */
   def link(group: Long): Unit =
-    command(Fetch.put(s"/api/groups/$group/invite-link").text)
-
-  /** Replaces one group's invite link with a new one, ending the old. */
-  def relink(group: Long): Unit =
-    command(Fetch.post(s"/api/groups/$group/invite-link").text)
-
-  /** Turns off one group's invite link. */
-  def unlink(group: Long): Unit =
-    command(Fetch.delete(s"/api/groups/$group/invite-link").text)
-
-  /** Discards the last error, so that a corrected form starts clean. */
-  def clearError(): Unit = errorVar.set(None)
-
-  /** A request that stores one group's name and place in the hierarchy. */
-  private def save
-    (id: Long, draft: GroupDraft)
-    : EventStream[FetchResponse[String]] = Fetch
-    .put(s"/api/groups/$id", body = draft)
-    .text
-
-  /** Replaces one list with what an endpoint returns, or with nothing. */
-  private def fetch[X : Decoder](url: String, into: Var[List[X]]): Unit =
-    Replied
-      .of(Fetch.get(url).text)
-      .foreach:
-        case Replied.Answered(response) =>
-          into.set(decode[List[X]](response.data).getOrElse(List.empty))
-        case _ => into.set(List.empty)
+    perform(Fetch.put(s"/api/groups/$group/invite-link").text)
 
   /**
-    * Runs one command, recording any refusal and refetching the lists.
+    * Replaces a group's invite link with a new one, ending the old.
     *
-    * @param refused
-    *   Called with the reason, should the server refuse this command. Not
-    *   called when the request fails to reach the server.
+    * @param group
+    *   The identifier of the group.
     */
-  private def command
+  def relink(group: Long): Unit =
+    perform(Fetch.post(s"/api/groups/$group/invite-link").text)
+
+  /**
+    * Turns off a group's invite link.
+    *
+    * @param group
+    *   The identifier of the group.
+    */
+  def unlink(group: Long): Unit =
+    perform(Fetch.delete(s"/api/groups/$group/invite-link").text)
+
+  /** Discards the last error. */
+  def clearError(): Unit = errorVar.set(None)
+
+  private def update
+    (group: Long, details: GroupDetails)
+    : EventStream[FetchResponse[String]] = Fetch
+    .put(s"/api/groups/$group", body = details)
+    .text
+
+  private def listed[X : Decoder](url: String): Signal[List[X]] = userId
+    .flatMapSwitch:
+      case None    => Val(List.empty[X])
+      case Some(_) => EventStream
+          .merge(
+            EventStream.fromValue(()),
+            refreshes.events,
+          )
+          .flatMapSwitch(_ => read[X](url))
+          .startWith(List.empty)
+    .observe
+
+  private def read[X : Decoder](url: String): EventStream[List[X]] = Outcome
+    .of(Fetch.get(url).text)
+    .map:
+      case Outcome.Answered(response) => decode[List[X]](response.data)
+          .getOrElse(List.empty)
+      case _ => List.empty
+
+  private def perform
     (
       request: EventStream[FetchResponse[String]],
       refused: String => Unit = _ => (),
     )
     : Unit =
-    pendingVar.set(true)
     errorVar.set(None)
-    Replied
-      .of(request)
-      .foreach: outcome =>
-        pendingVar.set(false)
-        outcome match
-          case Replied.Answered(_)      => errorVar.set(None)
-          case Replied.Refused(problem) =>
-            errorVar.set(Some(problem))
-            refused(problem)
-          // Nothing was refused, so nothing is reported to the one caller
-          // waiting on a refusal of its own; the reason a request never
-          // arrived is this state's own to word.
-          case Replied.Unreachable(_) => errorVar.set(Some(wording.unreachable))
-        refresh()
+    Outcome.tracked(auth.outcome(request), pendingVar): outcome =>
+      outcome match
+        case Outcome.Answered(_)     => errorVar.set(None)
+        case Outcome.Refused(reason) =>
+          errorVar.set(Some(reason))
+          refused(reason)
+          // Not a refusal, so `refused` is not called.
+        case Outcome.Unreachable(_) => errorVar.set(Some(wording.unreachable))
+      refresh()
 
 object GroupsState:
 
   /**
-    * Rebuilds the nesting of a flat group list, deepest branches included, with
-    * siblings ordered by name.
-    *
-    * No group may contain itself, however deeply: the server refuses any move
-    * that would nest one inside its own subtree, so a cycle can never be
-    * stored. Nothing here relies on that alone, as a group lost to a cycle
-    * would be a group its owner could no longer reach.
-    *
-    * Visible to the tests, which is the only way to reach it without a server
-    * to fetch a list from.
+    * Nests a flat group list, siblings ordered by name. A group whose parent is
+    * missing, or which a cycle would bury, is put at the top level, so that no
+    * group is lost.
     */
-  private[client] def nest(groups: List[GroupView]): List[GroupTree] =
+  private[client] def nest(groups: List[OwnedGroup]): List[GroupTree] =
     val ordered = groups.sortBy(_.group.name)
     val known   = ordered.map(_.group.id).toSet
-    // A group whose parent is missing is shown at the top level rather than
-    // being hidden, and so, after those, is any group a cycle would otherwise
-    // bury, so that no group can be lost.
     plant(
-      ordered.groupBy(_.group.parent),
-    )(ordered.filterNot(_.group.parent.exists(known)) ++ ordered)
+      ordered.groupBy(_.group.parentId),
+    )(ordered.filterNot(_.group.parentId.exists(known)) ++ ordered)
 
-  /**
-    * Grows a tree from each of the given groups in turn, skipping any that a
-    * tree already grown shows, so that every group appears exactly once.
-    */
   private def plant
-    (children: Map[Option[Long], List[GroupView]])
-    (roots: List[GroupView])
+    (children: Map[Option[Long], List[OwnedGroup]])
+    (roots: List[OwnedGroup])
     : List[GroupTree] = roots
     .foldLeft((List.empty[GroupTree], Set.empty[Long])):
       case ((forest, shown), view) if shown(view.group.id) => (forest, shown)
@@ -329,13 +362,10 @@ object GroupsState:
     ._1
     .reverse
 
-  /**
-    * One group together with every group nested inside it, never descending
-    * twice into the same group, so that a cycle could not spin forever.
-    */
+  // Skips enclosing groups, so that a cycle cannot recurse forever.
   private def grow
-    (children: Map[Option[Long], List[GroupView]])
-    (view: GroupView, enclosing: Set[Long])
+    (children: Map[Option[Long], List[OwnedGroup]])
+    (view: OwnedGroup, enclosing: Set[Long])
     : GroupTree = GroupTree(
     view,
     children
@@ -345,38 +375,39 @@ object GroupsState:
   )
 
 /**
-  * One group in the nested view, with the groups inside it.
+  * A group in the nested view, with the groups inside it.
   *
   * @param view
-  *   The group, its direct members and its invitees.
+  *   The group as its owner sees it.
   *
   * @param children
   *   The groups nested directly inside this one, ordered by name.
   */
 final case class GroupTree
   (
-    view: GroupView,
+    view: OwnedGroup,
     children: List[GroupTree],
   ):
 
-  /** This group and every group beneath it, in depth-first order. */
+  /** The trees of this group and every group beneath it, depth first. */
   def flatten: List[GroupTree] = this :: children.flatMap(_.flatten)
 
   /**
-    * This group and every group beneath it, in depth-first order, each paired
-    * with its depth below the top level, for rendering the tree as an indented
-    * list.
+    * Lists this group and every group beneath it, depth first, each with its
+    * depth.
     *
     * @param depth
-    *   The depth of this group, from `0` at the top level.
+    *   The depth of this group, `0` at the top level.
+    *
+    * @return
+    *   A list of each group paired with its depth.
     */
-  def ranked(depth: Int = 0): List[(GroupView, Int)] = (view, depth) ::
-    children.flatMap(_.ranked(depth + 1))
+  def outline(depth: Int = 0): List[(OwnedGroup, Int)] = (view, depth) ::
+    children.flatMap(_.outline(depth + 1))
 
   /**
-    * The distinct members of this group and of every group beneath it, ordered
-    * by username. Accepted members only: an invitee is not in a group, so is
-    * never counted here.
+    * The distinct members of this group and every group beneath it, ordered by
+    * username. Invitees are not members.
     */
   def members: List[User] = flatten
     .flatMap(_.view.members)

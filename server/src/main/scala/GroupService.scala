@@ -3,217 +3,344 @@ package server
 
 import cats.effect.IO
 import cats.effect.std.Console
-import com.alecdorrington.hecate.api.{AuthApi, GroupApi}
-import com.alecdorrington.hecate.i18n.Wording
-import com.alecdorrington.hecate.model.Caller
-import sttp.tapir.server.ServerEndpoint
+import cats.syntax.all.*
+import com.alecdorrington.hecate.model.{
+  Group, GroupDetails, Invitation, Invitee, JoinableGroup, Membership,
+  OwnedGroup, User,
+}
 
 /**
-  * The implementation of the API endpoints specified in [[GroupApi]], which
-  * manage the signed-in user's groups, their memberships, and the invitations,
-  * requests and links by which people join them.
+  * A service managing a signed-in user's groups, memberships, invitations,
+  * requests to join and invite links, independent of how it is served.
   *
   * @param groups
-  *   The store the groups are kept in.
-  *
-  * @param auth
-  *   The service that resolves session tokens to signed-in users.
+  *   The store of groups.
   *
   * @param report
-  *   Records a failure whose detail must not reach the client. Defaults to the
-  *   console, so that no failure goes unrecorded; a host application with its
-  *   own logging should pass its logger instead.
-  *
-  * @param wording
-  *   The wording refusals are written in, chosen by the language a request asks
-  *   for, or `None` when it asks for none. Defaults to the library's English
-  *   for every request; a host application should pass the same choice it gives
-  *   its [[AuthService]].
+  *   The handler of failures whose detail must not reach the client. The
+  *   default prints to the console.
   *
   * @param affected
-  *   Told, once each change is committed, whom it concerns: see [[Affected]]. A
-  *   change to who is in, invited to or asking to join a group, or to its
-  *   invite link, concerns its owner, its members and that person; a change to
-  *   the group itself concerns everyone who saw anything of it before or sees
-  *   anything of it after, and everyone at all when it was or is public.
-  *   Defaults to telling nobody.
+  *   The hook told whom each committed change concerns (see [[Affected]]).
   */
 final class GroupService
   (
     groups: GroupStore,
-    auth: AuthService,
     report: Throwable => IO[Unit] = error => Console[IO].printStackTrace(error),
-    wording: Option[String] => Wording = _ => Wording.english,
     affected: Affected => IO[Unit] = _ => IO.unit,
   ):
 
-  private val failures = Failures(wording, report)
+  private val failures = Failures(report)
 
-  /** An endpoint that lists the signed-in user's groups, with members. */
-  lazy val list: ServerEndpoint[Any, IO] =
-    served(GroupApi.list)(user => _ => groups.owned(user.id))
+  /**
+    * Lists the groups a user owns, with their members, invitees and applicants.
+    *
+    * @param user
+    *   The signed-in user.
+    *
+    * @return
+    *   An answer with the groups, or a refusal.
+    */
+  def list(user: User): Answer[List[OwnedGroup]] =
+    failures.attempt(groups.owned(user.id))
 
-  /** An endpoint that lists the groups the signed-in user is a member of. */
-  lazy val mine: ServerEndpoint[Any, IO] =
-    served(GroupApi.mine)(user => _ => groups.memberships(user.id))
+  /**
+    * Lists the groups a user is a member of.
+    *
+    * @param user
+    *   The signed-in user.
+    *
+    * @return
+    *   An answer with the memberships, or a refusal.
+    */
+  def mine(user: User): Answer[List[Membership]] =
+    failures.attempt(groups.memberships(user.id))
 
-  /** An endpoint that withdraws the signed-in user from one group. */
-  lazy val leave: ServerEndpoint[Any, IO] =
-    servedJoining(GroupApi.leave)(groups.leave)
+  /**
+    * Lists the groups a user may ask to join.
+    *
+    * @param user
+    *   The signed-in user.
+    *
+    * @return
+    *   An answer with the groups, or a refusal.
+    */
+  def joinable(user: User): Answer[List[JoinableGroup]] =
+    failures.attempt(groups.joinable(user.id))
 
-  /** An endpoint that makes the signed-in user a member of a group they own. */
-  lazy val join: ServerEndpoint[Any, IO] =
-    servedJoining(GroupApi.join)(groups.join)
+  /**
+    * Takes a user out of a group.
+    *
+    * @param user
+    *   The signed-in user.
+    *
+    * @param group
+    *   The identifier of the group.
+    */
+  def leave(user: User, group: Long): Answer[Unit] =
+    ownBehalf(user, group)(groups.leave)
 
-  /** An endpoint that lists the groups the signed-in user may ask to join. */
-  lazy val joinable: ServerEndpoint[Any, IO] =
-    served(GroupApi.joinable)(user => _ => groups.joinable(user.id))
+  /**
+    * Makes a user a member of a group they own.
+    *
+    * @param user
+    *   The signed-in user.
+    *
+    * @param group
+    *   The identifier of the group.
+    */
+  def join(user: User, group: Long): Answer[Unit] =
+    ownBehalf(user, group)(groups.join)
 
-  /** An endpoint that asks to join one group. */
-  lazy val request: ServerEndpoint[Any, IO] =
-    servedJoining(GroupApi.request)(groups.request)
+  /**
+    * Asks for a user to join a group they may see.
+    *
+    * @param user
+    *   The signed-in user.
+    *
+    * @param group
+    *   The identifier of the group.
+    */
+  def request(user: User, group: Long): Answer[Unit] =
+    ownBehalf(user, group)(groups.request)
 
-  /** An endpoint that withdraws a request to join one group. */
-  lazy val retract: ServerEndpoint[Any, IO] =
-    servedJoining(GroupApi.retract)(groups.retract)
+  /**
+    * Withdraws a user's request to join a group.
+    *
+    * @param user
+    *   The signed-in user.
+    *
+    * @param group
+    *   The identifier of the group.
+    */
+  def withdraw(user: User, group: Long): Answer[Unit] =
+    ownBehalf(user, group)(groups.withdraw)
 
-  /** An endpoint that makes one group public or private. */
-  lazy val publish: ServerEndpoint[Any, IO] = served(GroupApi.publish)(user =>
-    (id, public) =>
-      reshaping(IO.pure(Seq(id)))(groups.publish(user.id, id, public))(_ =>
-        Seq(id),
-      ),
-  )
+  /**
+    * Gives a group an invite link unless it has one.
+    *
+    * @param user
+    *   The signed-in user, who must own the group.
+    *
+    * @param group
+    *   The identifier of the group.
+    *
+    * @return
+    *   An answer with the link's code, or a refusal.
+    */
+  def link(user: User, group: Long): Answer[String] =
+    ownBehalf(user, group)(groups.link)
 
-  /** An endpoint that gives one group an invite link unless it has one. */
-  lazy val link: ServerEndpoint[Any, IO] =
-    servedJoining(GroupApi.link)(groups.link)
+  /**
+    * Replaces a group's invite link with one of a new code.
+    *
+    * @param user
+    *   The signed-in user, who must own the group.
+    *
+    * @param group
+    *   The identifier of the group.
+    *
+    * @return
+    *   An answer with the new code, or a refusal.
+    */
+  def relink(user: User, group: Long): Answer[String] =
+    ownBehalf(user, group)(groups.relink)
 
-  /** An endpoint that replaces one group's invite link with a new one. */
-  lazy val relink: ServerEndpoint[Any, IO] =
-    servedJoining(GroupApi.relink)(groups.relink)
+  /**
+    * Turns off a group's invite link.
+    *
+    * @param user
+    *   The signed-in user, who must own the group.
+    *
+    * @param group
+    *   The identifier of the group.
+    */
+  def unlink(user: User, group: Long): Answer[Unit] =
+    ownBehalf(user, group)(groups.unlink)
 
-  /** An endpoint that turns off one group's invite link. */
-  lazy val unlink: ServerEndpoint[Any, IO] =
-    servedJoining(GroupApi.unlink)(groups.unlink)
+  /**
+    * Creates a group owned by a user.
+    *
+    * @param user
+    *   The signed-in user.
+    *
+    * @param details
+    *   The group's name and parent.
+    *
+    * @return
+    *   An answer with the stored group, or a refusal.
+    */
+  def create(user: User, details: GroupDetails): Answer[Group] = named(
+    details.name,
+  )(reshaping(IO.pure(Seq.empty))(groups.create(user.id, details))(created =>
+    Seq(created.id),
+  ))
 
-  /** An endpoint that stores a new group for the signed-in user. */
-  lazy val create: ServerEndpoint[Any, IO] = served(GroupApi.create)(user =>
-    draft =>
-      reshaping(IO.pure(Seq.empty))(groups.create(user.id, draft))(created =>
-        Seq(created.id),
-      ),
-  )
+  /**
+    * Renames or moves a group.
+    *
+    * @param user
+    *   The signed-in user, who must own the group.
+    *
+    * @param group
+    *   The identifier of the group.
+    *
+    * @param details
+    *   The group's new name and parent.
+    */
+  def update
+    (
+      user: User,
+      group: Long,
+      details: GroupDetails,
+    )
+    : Answer[Unit] = named(details.name)(reshapingOne(group)(
+    groups.update(user.id, group, details),
+  ))
 
-  /** An endpoint that renames and/or moves one stored group. */
-  lazy val update: ServerEndpoint[Any, IO] = served(GroupApi.update)(user =>
-    (id, draft) =>
-      reshaping(IO.pure(Seq(id)))(groups.update(user.id, id, draft))(_ =>
-        Seq(id),
-      ),
-  )
-
-  /** An endpoint that deletes one stored group and its subgroups. */
-  lazy val delete: ServerEndpoint[Any, IO] = served(GroupApi.delete)(user =>
-    id =>
-      reshaping(groups.subtreeOf(user.id, id))(groups.delete(user.id, id))(_ =>
-        Seq.empty,
-      ),
-  )
-
-  /** An endpoint that invites one user to one group. */
-  lazy val invite: ServerEndpoint[Any, IO] = served(GroupApi.invite)(user =>
-    (id, request) =>
-      groups
-        .invite(user.id, id, request.username.trim)
-        .flatTap(invited => told(joined(Seq(id), invited.id))),
-  )
-
-  /** An endpoint that admits to one group a user who has asked to join it. */
-  lazy val admit: ServerEndpoint[Any, IO] = served(GroupApi.admit)(user =>
-    (id, member) => joining(Seq(id), member)(groups.admit(user.id, id, member)),
-  )
-
-  /** An endpoint that removes one member, invitee or applicant from one group. */
-  lazy val withdraw: ServerEndpoint[Any, IO] = served(GroupApi.withdraw)(user =>
-    (id, member) =>
-      joining(Seq(id), member)(groups.withdraw(user.id, id, member)),
-  )
-
-  /** An endpoint that lists the invitations sent to the signed-in user. */
-  lazy val invitations: ServerEndpoint[Any, IO] =
-    served(GroupApi.invitations)(user => _ => groups.invitations(user.id))
-
-  /** An endpoint that accepts one of the signed-in user's invitations. */
-  lazy val accept: ServerEndpoint[Any, IO] = served(GroupApi.accept)(user =>
-    id =>
-      groups
-        .invitedTo(user.id, id)
-        .flatMap(joining(_, user.id)(groups.accept(user.id, id))),
-  )
-
-  /** An endpoint that declines one of the signed-in user's invitations. */
-  lazy val decline: ServerEndpoint[Any, IO] = served(GroupApi.decline)(user =>
-    id =>
-      groups
-        .invitedTo(user.id, id)
-        .flatMap(joining(_, user.id)(groups.decline(user.id, id))),
-  )
-
-  /** Every endpoint implemented by this service. */
-  lazy val api: List[ServerEndpoint[Any, IO]] = List(
-    list,
-    mine,
-    joinable,
-    leave,
-    join,
-    request,
-    retract,
-    create,
-    update,
-    delete,
-    publish,
-    link,
-    relink,
-    unlink,
-    invite,
-    admit,
-    withdraw,
-    invitations,
-    accept,
-    decline,
+  /**
+    * Deletes a group and every group nested beneath it, passing whatever they
+    * alone owned to the user, who is told of it as [[Affected.Grants]].
+    *
+    * @param user
+    *   The signed-in user, who must own the group.
+    *
+    * @param group
+    *   The identifier of the group.
+    */
+  def delete(user: User, group: Long): Answer[Unit] = failures.attempt(
+    reshaping(groups.subtreeOf(user.id, group))(groups.delete(user.id, group))(
+      _ => Seq.empty,
+    ).flatMap(_.traverse_((resource, formerly) =>
+      tell(IO.pure(Affected.Grants(resource, formerly))),
+    )),
   )
 
   /**
-    * Runs a change to who is in, invited to or asking to join the given groups,
-    * or to their invite links, and once it is made, tells their owners, their
-    * members, who see one another, and the person it was about. Nobody else's
-    * view of the groups changes with it.
+    * Makes a group public or private.
+    *
+    * @param user
+    *   The signed-in user, who must own the group.
+    *
+    * @param group
+    *   The identifier of the group.
+    *
+    * @param public
+    *   Whether the group is to be public.
     */
-  private def joining[X]
+  def setPublic(user: User, group: Long, public: Boolean): Answer[Unit] =
+    failures.attempt(
+      reshapingOne(group)(groups.setPublic(user.id, group, public)),
+    )
+
+  /**
+    * Invites a user, named by username, to a group.
+    *
+    * @param user
+    *   The signed-in user, who must own the group.
+    *
+    * @param group
+    *   The identifier of the group.
+    *
+    * @param invitee
+    *   The user to invite, by username.
+    *
+    * @return
+    *   An answer with the invitee, or a refusal.
+    */
+  def invite(user: User, group: Long, invitee: Invitee): Answer[User] = named(
+    invitee.username,
+  )(
+    groups
+      .invite(user.id, group, invitee.username.trim)
+      .flatTap(invited => tell(membersChanged(Seq(group), invited.id))),
+  )
+
+  /**
+    * Admits someone who asked to join a group.
+    *
+    * @param user
+    *   The signed-in user, who must own the group.
+    *
+    * @param group
+    *   The identifier of the group.
+    *
+    * @param person
+    *   The identifier of the applicant.
+    */
+  def admit(user: User, group: Long, person: Long): Answer[Unit] = failures
+    .attempt(
+      changingMembers(Seq(group), person)(groups.admit(user.id, group, person)),
+    )
+
+  /**
+    * Removes a member, invitee or applicant from a group.
+    *
+    * @param user
+    *   The signed-in user, who must own the group.
+    *
+    * @param group
+    *   The identifier of the group.
+    *
+    * @param person
+    *   The identifier of the person to remove.
+    */
+  def remove(user: User, group: Long, person: Long): Answer[Unit] = failures
+    .attempt(
+      changingMembers(Seq(group), person)(groups.remove(user.id, group, person)),
+    )
+
+  /**
+    * Lists a user's unanswered invitations.
+    *
+    * @param user
+    *   The signed-in user.
+    *
+    * @return
+    *   An answer with the invitations, or a refusal.
+    */
+  def invitations(user: User): Answer[List[Invitation]] =
+    failures.attempt(groups.invitations(user.id))
+
+  /**
+    * Accepts one of a user's invitations, joining its group.
+    *
+    * @param user
+    *   The signed-in user.
+    *
+    * @param invitation
+    *   The identifier of the invitation.
+    */
+  def accept(user: User, invitation: Long): Answer[Unit] =
+    answering(user, invitation)(groups.accept)
+
+  /**
+    * Declines one of a user's invitations, deleting it.
+    *
+    * @param user
+    *   The signed-in user.
+    *
+    * @param invitation
+    *   The identifier of the invitation.
+    */
+  def decline(user: User, invitation: Long): Answer[Unit] =
+    answering(user, invitation)(groups.decline)
+
+  /**
+    * Runs a change to who is in, invited to or asking to join some groups, then
+    * tells their owners, their members and the person concerned.
+    */
+  private def changingMembers[X]
     (changed: Seq[Long], person: Long)
     (change: IO[X])
-    : IO[X] = change.flatTap(_ => told(joined(changed, person)))
+    : IO[X] = change.flatTap(_ => tell(membersChanged(changed, person)))
 
-  /** Whom a change to who is in the given groups concerns. */
-  private def joined(changed: Seq[Long], person: Long): IO[Affected] = groups
-    .surroundings(changed)
-    .map(_.joined(person))
+  private def membersChanged(changed: Seq[Long], person: Long): IO[Affected] =
+    groups.surroundings(changed).map(_.membersChanged(person))
 
   /**
-    * Runs a change to groups themselves: their names, nesting, visibility or
-    * existence. Once it is made, tells everyone who saw anything of the groups
-    * it affects as they were, asked about before the change, or sees anything
-    * of them as they are, asked about after it.
-    *
-    * @param before
-    *   The groups the change affects, as they stand before it.
-    *
-    * @param change
-    *   The change.
-    *
-    * @param after
-    *   The groups the change affected, as they stand after it.
+    * Runs a change to groups' names, nesting, visibility or existence, then
+    * tells everyone who saw them before or sees them after.
     */
   private def reshaping[X]
     (before: IO[Seq[Long]])
@@ -223,7 +350,7 @@ final class GroupService
     for
       earlier <- before.flatMap(groups.surroundings)
       result  <- change
-      _       <- told(
+      _       <- tell(
         groups
           .surroundings(after(result))
           .map(later =>
@@ -236,53 +363,29 @@ final class GroupService
       )
     yield result
 
-  /**
-    * Tells the host whom a change concerns. The change is made already, so a
-    * failure to work that out is reported rather than failing the request.
-    */
-  private def told(concerned: IO[Affected]): IO[Unit] = concerned
+  private def reshapingOne[X](group: Long)(change: IO[X]): IO[X] =
+    reshaping(IO.pure(Seq(group)))(change)(_ => Seq(group))
+
+  /** Tells the host whom a committed change concerns, reporting any failure. */
+  private def tell(concerned: IO[Affected]): IO[Unit] = concerned
     .flatMap(affected)
     .handleErrorWith(report)
 
-  /**
-    * Serves one endpoint of [[GroupApi]]: the session is resolved to a caller,
-    * the store is asked, and any failure is worded for them. Every endpoint
-    * here is this and nothing else.
-    *
-    * @param endpoint
-    *   The endpoint to serve.
-    *
-    * @param run
-    *   What the caller's request asks of the store.
-    *
-    * @return
-    *   The endpoint, with its logic.
-    */
-  private def served[I, O]
-    (endpoint: AuthApi.Secured[I, O])
-    (run: Caller => I => IO[O])
-    : ServerEndpoint[Any, IO] = endpoint
-    .serverSecurityLogic(auth.require)
-    .serverLogic(caller =>
-      input => failures.attempt(caller.locale)(run(caller)(input)),
-    )
-
-  /**
-    * Serves one endpoint of [[GroupApi]] that changes one group on the caller's
-    * own behalf, run as [[joining]] runs a change about the caller.
-    *
-    * @param endpoint
-    *   The endpoint to serve, whose input is the group.
-    *
-    * @param change
-    *   The change to make, given the identifiers of the caller and the group.
-    *
-    * @return
-    *   The endpoint, with its logic.
-    */
-  private def servedJoining[O]
-    (endpoint: AuthApi.Secured[Long, O])
-    (change: (Long, Long) => IO[O])
-    : ServerEndpoint[Any, IO] = served(endpoint)(user =>
-    id => joining(Seq(id), user.id)(change(user.id, id)),
+  private def ownBehalf[X]
+    (user: User, group: Long)
+    (change: (Long, Long) => IO[X])
+    : Answer[X] = failures.attempt(
+    changingMembers(Seq(group), user.id)(change(user.id, group)),
   )
+
+  private def answering
+    (user: User, invitation: Long)
+    (answer: (Long, Long) => IO[Unit])
+    : Answer[Unit] = failures.attempt(
+    groups
+      .invitedTo(user.id, invitation)
+      .flatMap(changingMembers(_, user.id)(answer(user.id, invitation))),
+  )
+
+  private def named[X](name: String)(change: => IO[X]): Answer[X] = failures
+    .attemptRefusable(checked(Bounds.name(name))(change.map(Right(_))))

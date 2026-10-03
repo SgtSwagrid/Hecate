@@ -1,12 +1,11 @@
 package com.alecdorrington.hecate
 package server
 
-import Fixtures.{enrol, give, newUser}
-// The query syntax of the very profile the tables under test are built on.
+import Fixtures.{enrol, grant, register}
 import TestDb.tables.profile.api.*
 import cats.effect.IO
 import com.alecdorrington.hecate.model.{
-  Access, Grant, GroupDraft, Principal, Resource,
+  Access, Grant, GroupDetails, Principal, Resource,
 }
 import munit.CatsEffectSuite
 
@@ -15,7 +14,6 @@ class GrantStoreSuite extends CatsEffectSuite:
   private val document      = Resource("document", 1)
   private val otherDocument = Resource("document", 2)
 
-  /** Runs a check against a grant store over a fresh in-memory database. */
   private def withStore
     (name: String)
     (check: (GrantStore, TestDb) => IO[Unit])
@@ -27,7 +25,7 @@ class GrantStoreSuite extends CatsEffectSuite:
     withStore("none"): (grants, _) =>
       for
         access  <- grants.access(1, List(10), document)
-        granted <- grants.grantsOver(document).map(_.nonEmpty)
+        granted <- grants.over(document).map(_.nonEmpty)
       yield
         assertEquals(access, None)
         assertEquals(granted, false)
@@ -35,7 +33,7 @@ class GrantStoreSuite extends CatsEffectSuite:
   test("a personal grant reaches its user and nobody else"):
     withStore("person"): (grants, db) =>
       for
-        _ <- give(grants, db)(
+        _ <- grant(grants, db)(
           document,
           Principal.Person(1),
           Access.Edit,
@@ -49,7 +47,7 @@ class GrantStoreSuite extends CatsEffectSuite:
   test("a group grant reaches exactly the users given that group"):
     withStore("group"): (grants, db) =>
       for
-        _ <- give(grants, db)(
+        _ <- grant(grants, db)(
           document,
           Principal.Group(10),
           Access.View,
@@ -63,12 +61,12 @@ class GrantStoreSuite extends CatsEffectSuite:
   test("the highest of every grant reaching a user wins"):
     withStore("highest"): (grants, db) =>
       for
-        _ <- give(grants, db)(
+        _ <- grant(grants, db)(
           document,
           Principal.Person(1),
           Access.View,
         )
-        _ <- give(grants, db)(
+        _ <- grant(grants, db)(
           document,
           Principal.Group(10),
           Access.Own,
@@ -79,7 +77,7 @@ class GrantStoreSuite extends CatsEffectSuite:
   test("a user and a group sharing an identifier are not confused"):
     withStore("discriminated"): (grants, db) =>
       for
-        _ <- give(grants, db)(
+        _ <- grant(grants, db)(
           document,
           Principal.Group(1),
           Access.Own,
@@ -90,18 +88,18 @@ class GrantStoreSuite extends CatsEffectSuite:
   test("regranting replaces a principal's access rather than adding to it"):
     withStore("regrant"): (grants, db) =>
       for
-        _ <- give(grants, db)(
+        _ <- grant(grants, db)(
           document,
           Principal.Person(1),
           Access.Own,
         )
-        _ <- give(grants, db)(
+        _ <- grant(grants, db)(
           document,
           Principal.Person(1),
           Access.View,
         )
         access <- grants.access(1, List.empty, document)
-        all    <- grants.grantsOver(document)
+        all    <- grants.over(document)
       yield
         assertEquals(access, Some(Access.View))
         assertEquals(
@@ -116,12 +114,12 @@ class GrantStoreSuite extends CatsEffectSuite:
   test("revoking one principal leaves every other principal's grant"):
     withStore("revoke"): (grants, db) =>
       for
-        _ <- give(grants, db)(
+        _ <- grant(grants, db)(
           document,
           Principal.Person(1),
           Access.Edit,
         )
-        _ <- give(grants, db)(
+        _ <- grant(grants, db)(
           document,
           Principal.Person(2),
           Access.Edit,
@@ -136,54 +134,97 @@ class GrantStoreSuite extends CatsEffectSuite:
   test("revoking everything over a resource leaves other resources alone"):
     withStore("revoke-all"): (grants, db) =>
       for
-        _ <- give(grants, db)(
+        _ <- grant(grants, db)(
           document,
           Principal.Person(1),
           Access.Own,
         )
-        _ <- give(grants, db)(
+        _ <- grant(grants, db)(
           document,
           Principal.Group(10),
           Access.View,
         )
-        _ <- give(grants, db)(
+        _ <- grant(grants, db)(
           otherDocument,
           Principal.Person(1),
           Access.Own,
         )
-        _    <- db.run(grants.revokeAll(document))
-        gone <- grants.grantsOver(document).map(_.nonEmpty)
-        kept <- grants.grantsOver(otherDocument).map(_.nonEmpty)
+        _    <- db.run(grants.revokeOver(document))
+        gone <- grants.over(document).map(_.nonEmpty)
+        kept <- grants.over(otherDocument).map(_.nonEmpty)
       yield
         assertEquals(gone, false)
         assertEquals(kept, true)
 
+  test("the grants over several resources are read in one, and no others"):
+    withStore("over-all"): (grants, db) =>
+      for
+        _ <- grant(grants, db)(
+          document,
+          Principal.Person(1),
+          Access.Own,
+        )
+        _ <- grant(grants, db)(
+          otherDocument,
+          Principal.Group(10),
+          Access.View,
+        )
+        _ <- grant(grants, db)(
+          Resource("document", 3),
+          Principal.Person(2),
+          Access.Own,
+        )
+        _ <- grant(grants, db)(
+          Resource("folder", 1),
+          Principal.Person(3),
+          Access.Own,
+        )
+        both <- grants.overAll("document", List(1L, 2L, 2L))
+        none <- grants.overAll("document", Nil)
+      yield
+        assertEquals(
+          both.toSet,
+          Set(
+            Grant(
+              document,
+              Principal.Person(1),
+              Access.Own,
+            ),
+            Grant(
+              otherDocument,
+              Principal.Group(10),
+              Access.View,
+            ),
+          ),
+        )
+        assertEquals(none, Nil)
+
   test("revoking what principals hold spares other principals of any kind"):
     withStore("revoke-held"): (grants, db) =>
       for
-        _ <- give(grants, db)(
+        _ <- grant(grants, db)(
           document,
           Principal.Group(10),
           Access.View,
         )
-        _ <- give(grants, db)(
+        _ <- grant(grants, db)(
           otherDocument,
           Principal.Group(10),
           Access.Edit,
         )
-        _ <- give(grants, db)(
+        _ <- grant(grants, db)(
           document,
           Principal.Group(11),
           Access.View,
         )
-        _ <- give(grants, db)(
+        _ <- grant(grants, db)(
           document,
           Principal.Person(10),
           Access.Edit,
         )
         _     <- db.run(grants.revokeHeldBy(List(Principal.Group(10))))
-        held  <- grants.grantsOver(document)
-        other <- grants.grantsOver(otherDocument)
+        held  <- grants.over(document)
+        other <- grants.over(otherDocument)
       yield
         assertEquals(
           held.map(_.principal).toSet,
@@ -197,36 +238,36 @@ class GrantStoreSuite extends CatsEffectSuite:
   test("revoking what no principals hold changes nothing"):
     withStore("revoke-none"): (grants, db) =>
       for
-        _ <- give(grants, db)(
+        _ <- grant(grants, db)(
           document,
           Principal.Group(10),
           Access.View,
         )
         _   <- db.run(grants.revokeHeldBy(List.empty))
-        all <- grants.grantsOver(document)
+        all <- grants.over(document)
       yield assertEquals(all.size, 1)
 
-  test("visible lists resources of one kind held at or above a level"):
-    withStore("visible"): (grants, db) =>
+  test("accessible lists resources of one kind held at or above a level"):
+    withStore("accessible"): (grants, db) =>
       for
-        _ <- give(grants, db)(
+        _ <- grant(grants, db)(
           document,
           Principal.Person(1),
           Access.Own,
         )
-        _ <- give(grants, db)(
+        _ <- grant(grants, db)(
           otherDocument,
           Principal.Group(10),
           Access.View,
         )
-        _ <- give(grants, db)(
+        _ <- grant(grants, db)(
           Resource("folder", 1),
           Principal.Person(1),
           Access.Own,
         )
-        edits  <- grants.visible(1, List(10), "document", Access.Edit)
-        views  <- grants.visible(1, List(10), "document", Access.View)
-        others <- grants.visible(2, List.empty, "document", Access.View)
+        edits  <- grants.accessible(1, List(10), "document", Access.Edit)
+        views  <- grants.accessible(1, List(10), "document", Access.View)
+        others <- grants.accessible(2, List.empty, "document", Access.View)
       yield
         assertEquals(edits, Set(1L))
         assertEquals(views, Set(1L, 2L))
@@ -235,22 +276,22 @@ class GrantStoreSuite extends CatsEffectSuite:
   test("levels map each resource of one kind to the highest access held"):
     withStore("levels"): (grants, db) =>
       for
-        _ <- give(grants, db)(
+        _ <- grant(grants, db)(
           document,
           Principal.Person(1),
           Access.View,
         )
-        _ <- give(grants, db)(
+        _ <- grant(grants, db)(
           document,
           Principal.Group(10),
           Access.Own,
         )
-        _ <- give(grants, db)(
+        _ <- grant(grants, db)(
           otherDocument,
           Principal.Group(10),
           Access.Edit,
         )
-        _ <- give(grants, db)(
+        _ <- grant(grants, db)(
           Resource("folder", 3),
           Principal.Person(1),
           Access.Own,
@@ -269,7 +310,7 @@ class GrantStoreSuite extends CatsEffectSuite:
             GrantRow(0, "document", 1, "person", 1, "admin"),
         )
         access <- grants.access(1, List.empty, document)
-        all    <- grants.grantsOver(document)
+        all    <- grants.over(document)
       yield
         assertEquals(access, None)
         assertEquals(all, List.empty)
@@ -283,22 +324,22 @@ class GrantStoreSuite extends CatsEffectSuite:
         val grants      = GrantStore(TestDb.tables, db)
         val permissions = Permissions(groups, grants)
         for
-          owner <- newUser(users, "manager")
-          inner <- newUser(users, "inner")
-          outer <- newUser(users, "outer")
-          dept  <- groups.create(owner.id, GroupDraft("Sales"))
+          owner <- register(users, "manager")
+          inner <- register(users, "inner")
+          outer <- register(users, "outer")
+          dept  <- groups.create(owner.id, GroupDetails("Sales"))
           team  <- groups.create(
             owner.id,
-            GroupDraft("Retail", Some(dept.id)),
+            GroupDetails("Retail", Some(dept.id)),
           )
           _ <- enrol(groups, owner, team.id, inner)
           _ <- enrol(groups, owner, dept.id, outer)
-          _ <- give(grants, db)(
+          _ <- grant(grants, db)(
             document,
             Principal.Group(dept.id),
             Access.View,
           )
-          _ <- give(grants, db)(
+          _ <- grant(grants, db)(
             otherDocument,
             Principal.Group(team.id),
             Access.Edit,
@@ -318,10 +359,10 @@ class GrantStoreSuite extends CatsEffectSuite:
         val grants      = GrantStore(TestDb.tables, db)
         val permissions = Permissions(groups, grants)
         for
-          owner    <- newUser(users, "manager")
-          employee <- newUser(users, "employee")
-          team     <- groups.create(owner.id, GroupDraft("Retail"))
-          _        <- give(grants, db)(
+          owner    <- register(users, "manager")
+          employee <- register(users, "employee")
+          team     <- groups.create(owner.id, GroupDetails("Retail"))
+          _        <- grant(grants, db)(
             document,
             Principal.Group(team.id),
             Access.View,
@@ -343,53 +384,54 @@ class GrantStoreSuite extends CatsEffectSuite:
   test("a sole owner is told which resources would be left ownerless"):
     withStore("sole"): (grants, db) =>
       for
-        _ <- give(grants, db)(
+        _ <- grant(grants, db)(
           document,
           Principal.Person(1),
           Access.Own,
         )
-        _ <- give(grants, db)(
+        _ <- grant(grants, db)(
           otherDocument,
           Principal.Person(1),
           Access.Own,
         )
-        _ <- give(grants, db)(
+        _ <- grant(grants, db)(
           otherDocument,
           Principal.Person(2),
           Access.Own,
         )
-        _ <- give(grants, db)(
+        _ <- grant(grants, db)(
           Resource("folder", 5),
           Principal.Person(1),
           Access.Edit,
         )
-        _ <- give(grants, db)(
+        _ <- grant(grants, db)(
           Resource("folder", 6),
           Principal.Person(3),
           Access.Own,
         )
-        sole <- db.run(grants.soleOwnerOf(Seq(Principal.Person(1))))
+        sole <- db.run(grants.ownedSolelyBy(Seq(Principal.Person(1))))
       yield assertEquals(sole, Seq(document))
 
   test("a group holding Own counts as another owner"):
     withStore("sole-group"): (grants, db) =>
       for
-        _ <- give(grants, db)(
+        _ <- grant(grants, db)(
           document,
           Principal.Person(1),
           Access.Own,
         )
-        _ <- give(grants, db)(
+        _ <- grant(grants, db)(
           document,
           Principal.Group(1),
           Access.Own,
         )
-        sole <- db.run(grants.soleOwnerOf(Seq(Principal.Person(1))))
+        sole <- db.run(grants.ownedSolelyBy(Seq(Principal.Person(1))))
       yield assertEquals(sole, Seq.empty)
 
-  test("reading the grants over a resource in a transaction agrees with out"):
-    withStore("granted"): (grants, db) =>
-      val give_ = give(grants, db)
+  test("a person owns alone only what nobody else holds anything over"):
+    withStore("alone"): (grants, db) =>
+      val give_ = grant(grants, db)
+      val notes = Resource("note", 1)
       for
         _ <- give_(
           document,
@@ -397,17 +439,42 @@ class GrantStoreSuite extends CatsEffectSuite:
           Access.Own,
         )
         _ <- give_(
+          otherDocument,
+          Principal.Person(1),
+          Access.Own,
+        )
+        _ <- give_(
+          otherDocument,
+          Principal.Group(2),
+          Access.View,
+        )
+        _     <- give_(notes, Principal.Person(1), Access.Own)
+        alone <- db.run(grants.ownedAlone(1, "document").result)
+        none  <- db.run(grants.ownedAlone(2, "document").result)
+      yield
+        assertEquals(alone, Seq(document.id))
+        assertEquals(none, Seq.empty)
+
+  test("reading the grants over a resource in a transaction agrees with out"):
+    withStore("granted"): (grants, db) =>
+      for
+        _ <- grant(grants, db)(
+          document,
+          Principal.Person(1),
+          Access.Own,
+        )
+        _ <- grant(grants, db)(
           document,
           Principal.Group(2),
           Access.View,
         )
-        _ <- give_(
+        _ <- grant(grants, db)(
           otherDocument,
           Principal.Person(3),
           Access.Edit,
         )
         inside <- db.run(grants.granted(document))
-        beside <- grants.grantsOver(document)
+        beside <- grants.over(document)
       yield
         assertEquals(inside.toSet, beside.toSet)
         assertEquals(

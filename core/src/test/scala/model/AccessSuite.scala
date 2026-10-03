@@ -18,27 +18,27 @@ class AccessSuite extends FunSuite:
       List(Access.View, Access.Edit, Access.Own),
     )
 
-  test("levels are stored under stable lower-case names"):
+  test("levels are stored under stable lower-case codes"):
     assertEquals(
-      Access.values.map(_.name).toList,
+      Access.values.map(_.code).toList,
       List("view", "edit", "own"),
     )
 
-  test("every level is found again by its name"):
+  test("every level is found again by its code"):
     Access
       .values
       .foreach(level =>
         assertEquals(
-          Access.fromName(level.name),
+          Access.fromCode(level.code),
           Some(level),
         ),
       )
 
-  test("a level is sent as its name rather than as an object"):
+  test("a level is sent as its code rather than as an object"):
     assertEquals(
       Access.Edit.asJson,
       Json.fromString("edit"),
     )
 
-  test("an unknown name is refused rather than defaulted"):
+  test("an unknown code is refused rather than defaulted"):
     assert(Json.fromString("admin").as[Access].isLeft)

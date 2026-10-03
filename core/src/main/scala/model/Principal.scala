@@ -5,23 +5,18 @@ import io.circe.{Codec, Decoder, Encoder, JsonObject}
 import io.circe.syntax.*
 
 /**
-  * Whoever access may be granted to: either one user, or one group. Access
-  * granted to a group reaches every member of that group and of every group
-  * nested inside it, but never the members of any group enclosing it.
-  *
-  * A principal is stored and sent as its [[kind]] and its [[id]], the kind
-  * being spelled out explicitly rather than derived from the name of its case,
-  * so that renaming a case in the code cannot orphan anything already stored.
+  * A user or group that access may be granted to. Access granted to a group
+  * reaches the members of it and of every group nested inside it, never of the
+  * groups enclosing it. Stored and sent as its [[kind]] and [[id]].
   *
   * @param kind
   *   The name this kind of principal is stored and sent as (e.g. `person`).
-  *   This is a persisted storage format, shared by every table that stores a
-  *   principal, and must never change once any principal has been stored.
+  *   Must never change once stored.
   */
 enum Principal(val kind: String):
 
   /**
-    * One user.
+    * A user.
     *
     * @param id
     *   The identifier of the user.
@@ -29,7 +24,7 @@ enum Principal(val kind: String):
   case Person(id: Long) extends Principal(Principal.personKind)
 
   /**
-    * One group.
+    * A group.
     *
     * @param id
     *   The identifier of the group.
@@ -37,19 +32,18 @@ enum Principal(val kind: String):
   case Group(id: Long) extends Principal(Principal.groupKind)
 
   /**
-    * The identifier of the user or group, unique only within its kind. Users
-    * and groups are numbered independently, so person `7` and group `7` are
-    * different principals, and comparing identifiers across kinds is a bug.
+    * The identifier of the user or group, unique only within its kind: person
+    * `7` and group `7` are different principals.
     */
   def id: Long
 
 object Principal:
 
   /** The stored name of the kind of a [[Principal.Person]]. Never change it. */
-  val personKind = "person"
+  val personKind: String = "person"
 
   /** The stored name of the kind of a [[Principal.Group]]. Never change it. */
-  val groupKind = "group"
+  val groupKind: String = "group"
 
   /**
     * Restores a principal from the kind and identifier it is stored as.
@@ -68,7 +62,6 @@ object Principal:
     case `groupKind`  => Some(Group(id))
     case _            => None
 
-  /** Encodes a principal as its kind and identifier, refusing unknown kinds. */
   given Codec.AsObject[Principal] = Codec
     .AsObject
     .from(

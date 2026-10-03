@@ -6,28 +6,30 @@ import munit.CatsEffectSuite
 
 class PasswordsSuite extends CatsEffectSuite:
 
-  /**
-    * The iteration count hashes are derived under here, far below any a host
-    * should use, so that each derivation is quick.
-    */
-  private val rounds = 1000
+  private val iterations = 1000
 
   test("a hashed password verifies against itself"):
     Passwords
-      .hash("correct horse battery staple", rounds)
+      .hash(
+        "correct horse battery staple",
+        iterations,
+      )
       .flatMap(Passwords.verify("correct horse battery staple", _))
       .assertEquals(true)
 
   test("a wrong password does not verify"):
     Passwords
-      .hash("correct horse battery staple", rounds)
+      .hash(
+        "correct horse battery staple",
+        iterations,
+      )
       .flatMap(Passwords.verify("Tr0ub4dor&3", _))
       .assertEquals(false)
 
   test("hashing the same password twice yields different hashes"):
     for
-      first  <- Passwords.hash("password123", rounds)
-      second <- Passwords.hash("password123", rounds)
+      first  <- Passwords.hash("password123", iterations)
+      second <- Passwords.hash("password123", iterations)
     yield assertNotEquals(first, second)
 
   test("a malformed stored hash never verifies"):
@@ -43,28 +45,29 @@ class PasswordsSuite extends CatsEffectSuite:
     ).traverse_(Passwords.verify("anything", _).assertEquals(false))
 
   test("no password verifies against the decoy"):
-    Passwords.verify("anything", Passwords.decoy(rounds)).assertEquals(false)
+    Passwords
+      .verify(
+        "anything",
+        Passwords.decoy(iterations),
+      )
+      .assertEquals(false)
 
-  /**
-    * The decoy exists so that an unknown username costs a full derivation and
-    * cannot be told apart by timing, which only holds while it stays in the
-    * shape [[Passwords.verify]] takes all the way to the hash comparison, and
-    * costs the count real passwords are derived under. An empty salt or hash
-    * would be rejected outright, silently reopening the timing channel.
-    */
   test("the decoy is well formed, so verifying it costs a real derivation"):
-    Passwords.decoy(rounds).split(':') match
+    Passwords.decoy(iterations).split(':') match
       case Array(count, salt, hash) =>
-        assertEquals(count.toIntOption, Some(rounds))
+        assertEquals(count.toIntOption, Some(iterations))
         assert(salt.nonEmpty)
         assert(hash.nonEmpty)
       case other => fail(s"The decoy is malformed: ${ other.mkString(":") }")
 
-  test("a hash derived under fewer rounds is the one marked outdated"):
+  test("a hash derived under fewer iterations is the one marked outdated"):
     Passwords
-      .hash("correct horse battery staple", rounds)
+      .hash(
+        "correct horse battery staple",
+        iterations,
+      )
       .map: hash =>
-        assert(Passwords.outdated(hash, rounds + 1))
-        assert(!Passwords.outdated(hash, rounds))
+        assert(Passwords.outdated(hash, iterations + 1))
+        assert(!Passwords.outdated(hash, iterations))
         assert(!Passwords.outdated(hash, 1))
-        assert(!Passwords.outdated("nonsense", rounds + 1))
+        assert(!Passwords.outdated("nonsense", iterations + 1))
