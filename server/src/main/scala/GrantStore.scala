@@ -8,74 +8,54 @@ import com.alecdorrington.hecate.model.{
 import slick.dbio.DBIO
 
 /**
-  * The store of grants: which principals hold which access over which
-  * resources. Resources are named in the host application's own terms, so this
-  * store never knows what they are.
+  * A store of grants: which principals hold which access over which resources,
+  * named in the host's own terms. Access is resolved against the principals the
+  * caller supplies; [[Permissions]] joins this with [[GroupStore]].
   *
-  * Access is resolved against whichever groups the caller supplies, so that
-  * this store needs no [[GroupStore]], and group membership is walked once, by
-  * [[GroupStore.groupIdsOf]], and never again here. [[Permissions]] joins the
-  * two.
-  *
-  * Writes are returned as actions rather than run, so that a host application
-  * can grant ownership in the same transaction that creates a resource, and
-  * withdraw every grant in the same transaction that deletes one.
+  * Writes are returned as actions to compose into the host's transactions. A
+  * principal holds at most one grant per resource only if the caller locks the
+  * resource's own row earlier in the same transaction before [[grant]],
+  * [[raise]] or [[revokeOver]], as the check-then-insert races under
+  * `READ COMMITTED` otherwise. A resource created in the same transaction needs
+  * no lock. A duplicate that slips through confers only its highest level, and
+  * the next grant replaces it.
   *
   * @param tables
   *   The tables the grants are stored in.
   *
   * @param db
-  *   The database to run the queries against.
+  *   The database to run queries against.
   */
 final class GrantStore(tables: AuthTables, db: Transactor):
 
   import tables.profile.api.*
 
+  private val links = LinkStore(tables)
+
   /**
-    * Grants one principal exactly the given access over one resource, replacing
-    * whatever access they already held over it, whether higher or lower. Runs
-    * as one transaction, which joins the caller's if there is one.
-    *
-    * At most one grant per principal per resource is guaranteed only when the
-    * caller has locked the resource's own row earlier in the same transaction.
-    * No table can declare the key that would otherwise enforce it (see
-    * [[AuthTables]]), and under `READ COMMITTED` two unlocked grants racing for
-    * the same principal can both find nothing to replace and both insert. The
-    * resource belongs to the host application, so only the host can lock it. A
-    * resource created in the same transaction needs no lock, since no other
-    * transaction can see it yet. A duplicate that does slip through is
-    * harmless: resolution takes the highest level, revocation removes every
-    * matching row, and the next grant to that principal replaces them all.
-    *
-    * Deleting the resource must take the same lock before calling
-    * [[revokeAll]], for the same reason: a grant written concurrently would
-    * otherwise commit after the revocation and outlive the resource.
+    * Grants a principal exactly the given access over a resource, replacing any
+    * it held, higher or lower. Locks a person's row, so that a grant and the
+    * person's [[AccountStore.delete]] take turns.
     *
     * @param granted
     *   The grant to hold from now on.
     *
     * @return
-    *   An action storing the grant.
+    *   An action storing the grant, in a transaction joining the caller's.
     */
-  def grant(granted: Grant): DBIO[Unit] = DBIO
-    .seq(
-      lockPerson(granted.principal),
-      held(granted.resource, granted.principal).delete,
-      tables.grants += GrantRow.of(granted),
-    )
+  def grant(granted: Grant): DBIO[Unit] = lockPerson(granted.principal)
+    .flatMap(_ => replace(granted))
     .transactionally
 
   /**
-    * Grants one principal at least the given access over one resource, keeping
-    * any higher access they already hold over it themselves, so that accepting
-    * a lesser offer never costs anybody anything. Locks as [[grant]] does, and
-    * needs the caller to lock the resource as [[grant]] does.
+    * Grants a principal at least the given access over a resource, keeping any
+    * higher access it holds. Locks as [[grant]] does.
     *
     * @param granted
-    *   The grant to hold at least from now on.
+    *   The least grant to hold from now on.
     *
     * @return
-    *   An action storing the grant, unless as much is held already.
+    *   An action storing the grant unless as much is held already.
     */
   def raise(granted: Grant): DBIO[Unit] = lockPerson(granted.principal)
     .flatMap(_ =>
@@ -83,24 +63,23 @@ final class GrantStore(tables: AuthTables, db: Transactor):
     )
     .flatMap(levels =>
       if GrantStore.highest(levels).exists(_.includes(granted.access)) then
-        DBIO.successful(())
-      else grant(granted),
+        DBIO.unit
+      else replace(granted),
     )
     .transactionally
 
-  /**
-    * Locks the row of the person granted to, if the principal is a person and
-    * the database can, so that a grant and the deletion of that person's
-    * account take turns rather than leaving a grant that outlives the account.
-    */
   private def lockPerson(principal: Principal): DBIO[Unit] = principal match
-    case Principal.Person(id) =>
-      tables.locked(tables.users.filter(_.id === id)).result.unit
-    case Principal.Group(_) => DBIO.successful(())
+    case Principal.Person(id)                  => tables.lockUser(id).unit
+    case Principal.Group(_) | Principal.System => DBIO.unit
+
+  /** The caller must hold the lock [[grant]] takes. */
+  private def replace(granted: Grant): DBIO[Unit] = DBIO.seq(
+    held(granted.resource, granted.principal).delete,
+    tables.grants += GrantRow.of(granted),
+  )
 
   /**
-    * Withdraws whatever access one principal holds over one resource, leaving
-    * every other principal's grants over it in place.
+    * Withdraws a principal's access over a resource.
     *
     * @param resource
     *   The resource to withdraw access over.
@@ -109,19 +88,15 @@ final class GrantStore(tables: AuthTables, db: Transactor):
     *   The user or group to withdraw access from.
     *
     * @return
-    *   An action withdrawing the grant, which does nothing if there is none.
+    *   An action withdrawing the grant, doing nothing if there is none.
     */
   def revoke(resource: Resource, principal: Principal): DBIO[Unit] =
     held(resource, principal).delete.unit
 
   /**
-    * Withdraws every grant over one resource, and turns off its invite link, so
-    * that no link can grant access to it afterwards. No foreign key will ever
-    * remove a grant naming a resource that no longer exists, so a host
-    * application must compose this into the transaction deleting the resource
-    * itself. Opens no transaction of its own. The caller must lock the
-    * resource's row before calling this, not merely when deleting the row
-    * itself, or a grant being written concurrently can commit after it.
+    * Withdraws every grant over a resource and turns off its invite link. No
+    * foreign key removes them, so the host must compose this into the
+    * transaction deleting the resource, after locking its row.
     *
     * @param resource
     *   The resource being deleted.
@@ -129,54 +104,39 @@ final class GrantStore(tables: AuthTables, db: Transactor):
     * @return
     *   An action withdrawing every grant over the resource.
     */
-  def revokeAll(resource: Resource): DBIO[Unit] = over(resource)
+  def revokeOver(resource: Resource): DBIO[Unit] = rowsOver(resource)
     .delete
-    .flatMap(_ => links.remove(LinkTarget.Sharing(resource, Access.View)))
-
-  /** The links to resources, which go with the resources' grants. */
-  private val links = LinkStore(tables)
+    .flatMap(_ => links.delete(LinkTarget.Sharing(resource, Access.View)))
 
   /**
-    * Withdraws every grant held by any of the given principals, over any
-    * resource, so that nothing a deleted group held outlives it. Composes into
-    * the caller's transaction and opens none of its own. Given no principals,
-    * it does nothing, and never asks the database about an empty set.
+    * Withdraws every grant held by any of the given principals.
     *
     * @param principals
     *   The users or groups whose grants to withdraw.
     *
     * @return
-    *   An action withdrawing every such grant.
+    *   An action withdrawing the grants, in the caller's transaction.
     */
   def revokeHeldBy(principals: Seq[Principal]): DBIO[Unit] =
     ifAny(principals)(()): held =>
       tables.grants.filter(heldByAny(_, held)).delete.unit
 
   /**
-    * The resources over which the given principals, between them, are the only
-    * holders of `Own`, so that deleting all of them at once would leave each
-    * with no owner at all. Any other holder, a group included, counts. Composes
-    * into the caller's transaction and opens none of its own, so that a
-    * deletion can refuse before removing anything.
-    *
-    * A surviving holder is a holder of the grant, not necessarily a person who
-    * can act on it: a group with no members at all counts, and so does one
-    * whose only members are being deleted alongside. What this guarantees is
-    * that some principal still holds `Own`, not that somebody can still reach
-    * the resource. Whether that is enough is the host application's to decide,
-    * since only it knows what its resources are worth.
+    * Finds the resources of which the given principals are, between them, the
+    * only holders of `Own`. Any other holder counts, even a group with no
+    * members, so this guarantees only that some principal would still hold
+    * `Own`, not that anyone could still reach the resource.
     *
     * @param principals
-    *   The users and groups about to be deleted together, such as a user and
-    *   every group they own.
+    *   The users and groups about to be deleted together.
     *
     * @return
-    *   An action yielding every such resource, each once, possibly none.
+    *   An action yielding each such resource once, in the caller's transaction.
     */
-  def soleOwnerOf(principals: Seq[Principal]): DBIO[Seq[Resource]] = tables
+  def ownedSolelyBy(principals: Seq[Principal]): DBIO[Seq[Resource]] = tables
     .grants
     .filter(mine =>
-      heldByAny(mine, principals) && mine.access === Access.Own.name,
+      heldByAny(mine, principals) && mine.access === Access.Own.code,
     )
     .filterNot(mine =>
       tables
@@ -184,7 +144,7 @@ final class GrantStore(tables: AuthTables, db: Transactor):
         .filter(other =>
           other.resourceKind === mine.resourceKind &&
           other.resourceId === mine.resourceId &&
-          other.access === Access.Own.name && !heldByAny(other, principals),
+          other.access === Access.Own.code && !heldByAny(other, principals),
         )
         .exists,
     )
@@ -194,149 +154,251 @@ final class GrantStore(tables: AuthTables, db: Transactor):
     .map(_.map((kind, id) => Resource(kind, id)))
 
   /**
-    * Lists every readable grant over one resource, for showing who holds access
-    * to it and for checking directly what was stored.
+    * Finds the resources any of the given principals holds `Own` over.
+    *
+    * @param principals
+    *   The users or groups.
+    *
+    * @return
+    *   An action yielding each such resource once, in ascending order.
     */
-  def grantsOver(resource: Resource): IO[List[Grant]] =
-    db.run(granted(resource))
+  def ownedByAny(principals: Seq[Principal]): DBIO[Seq[Resource]] = ifAny(
+    principals,
+  )(Seq.empty[Resource]): owners =>
+    tables
+      .grants
+      .filter(row => heldByAny(row, owners) && row.access === Access.Own.code)
+      .map(row => (row.resourceKind, row.resourceId))
+      .distinct
+      .sortBy(identity)
+      .result
+      .map(_.map((kind, id) => Resource(kind, id)))
 
   /**
-    * As [[grantsOver]], but composing into the caller's transaction, so that a
-    * host can read who holds a resource after locking it and before changing
-    * its grants, and refuse a change that would leave it with no owner.
-    */
-  def granted(resource: Resource): DBIO[List[Grant]] = over(resource)
-    .result
-    .map(_.toList.flatMap(_.toGrant))
-
-  /**
-    * The highest access that reaches one user over one resource, through a
-    * grant to them personally or to any of the given groups.
+    * The resources of a kind that a user owns and nobody else holds anything
+    * over, as a query the host can narrow further.
     *
     * @param user
     *   The identifier of the user.
     *
-    * @param groups
-    *   The identifiers of every group the user effectively belongs to. These
-    *   must come from [[GroupStore.groupIdsOf]], which includes every enclosing
-    *   group, and never from [[GroupStore.memberships]], which lists direct
-    *   memberships only and would let a grant to an enclosing group miss them.
+    * @param kind
+    *   The kind of resource, as the host names it.
+    *
+    * @return
+    *   A query of the identifiers of those resources.
+    */
+  def ownedAlone(user: Long, kind: String): Query[Rep[Long], Long, Seq] =
+    val person = Principal.Person(user)
+    tables
+      .grants
+      .filter(mine =>
+        mine.resourceKind === kind && heldBy(mine, person) &&
+        mine.access === Access.Own.code,
+      )
+      .filterNot(mine =>
+        tables
+          .grants
+          .filter(other =>
+            other.resourceKind === mine.resourceKind &&
+            other.resourceId === mine.resourceId && !heldBy(other, person),
+          )
+          .exists,
+      )
+      .map(_.resourceId)
+
+  /**
+    * Lists the readable grants over a resource.
+    *
+    * @param resource
+    *   The resource whose grants to list.
+    *
+    * @return
+    *   An effect producing the grants.
+    */
+  def over(resource: Resource): IO[List[Grant]] = db.run(granted(resource))
+
+  /** Runs an action against the store's database, for a resolver over it. */
+  private[server] def run[X](action: DBIO[X]): IO[X] = db.run(action)
+
+  /**
+    * Lists, in one query, the readable grants over several resources of one
+    * kind.
+    *
+    * @param kind
+    *   The kind of the resources, as the host names it.
+    *
+    * @param ids
+    *   The identifiers of the resources.
+    *
+    * @return
+    *   An effect producing the grants.
+    */
+  def overAll(kind: String, ids: Seq[Long]): IO[List[Grant]] = db.run:
+    ifAny(ids.distinct)(List.empty[Grant]): wanted =>
+      tables
+        .grants
+        .filter(row =>
+          row.resourceKind === kind && (row.resourceId inSet wanted),
+        )
+        .result
+        .map(_.toList.flatMap(_.toGrant))
+
+  /**
+    * Lists the readable grants over a resource within the caller's transaction,
+    * such as after locking it.
+    *
+    * @param resource
+    *   The resource whose grants to list.
+    *
+    * @return
+    *   An action yielding the grants.
+    */
+  def granted(resource: Resource): DBIO[List[Grant]] = rowsOver(resource)
+    .result
+    .map(_.toList.flatMap(_.toGrant))
+
+  /**
+    * Resolves the highest access reaching a user over a resource, through a
+    * grant to any of the principals they act as.
+    *
+    * @param principals
+    *   The principals the user acts as, from [[GroupStore.principalsOf]]:
+    *   themselves, every group enclosing them, and any other they act for.
     *
     * @param resource
     *   The resource to resolve access over.
     *
     * @return
-    *   A highest level of access reaching the user, or `None` if no grant does.
+    *   An effect producing the highest level, or `None` if no grant reaches the
+    *   user.
     */
   def access
     (
-      user: Long,
-      groups: Seq[Long],
+      principals: Seq[Principal],
       resource: Resource,
     )
-    : IO[Option[Access]] = db
-    .run(reaching(user, groups).filter(matching(resource)).map(_.access).result)
-    .map(GrantStore.highest)
+    : IO[Option[Access]] = db.run(accessOf(principals, resource))
+
+  /** As [[access]], in the caller's transaction. */
+  private[server] def accessOf
+    (
+      principals: Seq[Principal],
+      resource: Resource,
+    )
+    : DBIO[Option[Access]] = ifAny(principals)(Option.empty[Access]): held =>
+    reaching(held)
+      .filter(matching(resource))
+      .map(_.access)
+      .result
+      .map(GrantStore.highest)
 
   /**
-    * The identifiers of every resource of one kind over which one user holds at
-    * least the given access, resolved in a single query, which asks the
-    * database for the grants that are high enough rather than reading every
-    * grant that reaches the user and sifting them here.
+    * Lists, in one query, the resources of one kind over which a user holds at
+    * least the given access.
     *
-    * @param user
-    *   The identifier of the user.
-    *
-    * @param groups
-    *   The identifiers of every group the user effectively belongs to, from
-    *   [[GroupStore.groupIdsOf]] and never [[GroupStore.memberships]], as for
-    *   [[access]].
+    * @param principals
+    *   The principals the user acts as, as for [[access]].
     *
     * @param kind
-    *   The kind of resource to list, as named by the host application.
+    *   The kind of resource, as the host names it.
     *
     * @param least
     *   The lowest level of access that counts.
     *
     * @return
-    *   A set of the identifiers of every such resource, possibly empty.
+    *   An effect producing the identifiers of the resources.
     */
-  def visible
+  def accessible
     (
-      user: Long,
-      groups: Seq[Long],
+      principals: Seq[Principal],
       kind: String,
       least: Access,
     )
-    : IO[Set[Long]] = db
-    .run(
-      reaching(user, groups)
-        .filter(row =>
-          row.resourceKind === kind &&
-          (row.access inSet GrantStore.atLeast(least)),
-        )
-        .map(_.resourceId)
-        .distinct
-        .result,
+    : IO[Set[Long]] = db.run(accessibleAt(principals, kind, least))
+
+  /** As [[accessible]], in the caller's transaction. */
+  private[server] def accessibleAt
+    (
+      principals: Seq[Principal],
+      kind: String,
+      least: Access,
     )
-    .map(_.toSet)
+    : DBIO[Set[Long]] = ifAny(principals)(Set.empty[Long]): held =>
+    reaching(held)
+      .filter(row =>
+        row.resourceKind === kind &&
+        (row.access inSet GrantStore.atLeast(least)),
+      )
+      .map(_.resourceId)
+      .distinct
+      .result
+      .map(_.toSet)
 
   /**
-    * The highest access one user holds over every resource of one kind that a
-    * readable grant reaching them names, resolved in a single query.
+    * Resolves, in one query, the highest access a user holds over every
+    * resource of one kind that a readable grant reaching them names.
     *
-    * @param user
-    *   The identifier of the user.
-    *
-    * @param groups
-    *   The identifiers of every group the user effectively belongs to, from
-    *   [[GroupStore.groupIdsOf]] and never [[GroupStore.memberships]], as for
-    *   [[access]].
+    * @param principals
+    *   The principals the user acts as, as for [[access]].
     *
     * @param kind
-    *   The kind of resource to resolve, as named by the host application.
+    *   The kind of resource, as the host names it.
     *
     * @return
-    *   A map from the identifier of each such resource to the highest level of
-    *   access the user holds over it. A resource no readable grant reaches is
-    *   absent from it.
+    *   An effect producing each resource's identifier mapped to the highest
+    *   level the user holds over it.
     */
-  def levels
-    (
-      user: Long,
-      groups: Seq[Long],
-      kind: String,
-    )
-    : IO[Map[Long, Access]] = db
-    .run(
-      reaching(user, groups)
+  def levels(principals: Seq[Principal], kind: String): IO[Map[Long, Access]] =
+    db.run(levelsAt(principals, kind))
+
+  /** As [[levels]], in the caller's transaction. */
+  private[server] def levelsAt
+    (principals: Seq[Principal], kind: String)
+    : DBIO[Map[Long, Access]] = ifAny(principals)(Map.empty[Long, Access]):
+    held =>
+      reaching(held)
         .filter(_.resourceKind === kind)
         .map(row => (row.resourceId, row.access))
-        .result,
-    )
-    .map(rows =>
-      rows
-        .groupMap(_._1)(_._2)
-        .flatMap((id, stored) => GrantStore.highest(stored).map(id -> _)),
-    )
+        .result
+        .map(rows =>
+          rows
+            .groupMap(_._1)(_._2)
+            .flatMap((id, stored) => GrantStore.highest(stored).map(id -> _)),
+        )
 
-  /** The query for every grant over one resource. */
-  private def over(resource: Resource) = tables
+  /**
+    * Lists the grants of one level or above over several resources of one kind,
+    * in the caller's transaction.
+    */
+  private[server] def grantedAt
+    (
+      kind: String,
+      ids: Seq[Long],
+      least: Access,
+    )
+    : DBIO[List[Grant]] = ifAny(ids.distinct)(List.empty[Grant]): wanted =>
+    tables
+      .grants
+      .filter(row =>
+        row.resourceKind === kind && (row.resourceId inSet wanted) &&
+        (row.access inSet GrantStore.atLeast(least)),
+      )
+      .result
+      .map(_.toList.flatMap(_.toGrant))
+
+  private def rowsOver(resource: Resource) = tables
     .grants
     .filter(matching(resource))
 
-  /** The query for one principal's grant over one resource. */
-  private def held(resource: Resource, principal: Principal) = over(resource)
-    .filter(heldBy(_, principal))
+  private def held(resource: Resource, principal: Principal) =
+    rowsOver(resource).filter(heldBy(_, principal))
 
-  /** Whether a grant row is held by the given principal. */
   private def heldBy(row: tables.Grants, principal: Principal): Rep[Boolean] =
     row.principalKind === principal.kind && row.principalId === principal.id
 
   /**
-    * Whether a grant row is held by any of the given principals, asked one term
-    * per kind rather than one per principal, so that a long list of users is a
-    * single `IN`. No principals at all is nobody.
+    * Whether a grant row is held by any of the principals, with one `IN` per
+    * kind.
     */
   private def heldByAny
     (
@@ -351,47 +413,27 @@ final class GrantStore(tables: AuthTables, db: Transactor):
     .reduceOption(_ || _)
     .getOrElse(LiteralColumn(false))
 
-  /** Whether a grant row is over the given resource. */
   private def matching(resource: Resource)(row: tables.Grants): Rep[Boolean] =
     row.resourceKind === resource.kind && row.resourceId === resource.id
 
-  /**
-    * The query for every grant reaching one user: those to them personally, and
-    * those to any of the given groups. A user and a group sharing an identifier
-    * are told apart by the kind of principal, never confused. Given no groups,
-    * only personal grants are sought, without asking about an empty set.
-    */
-  private def reaching(user: Long, groups: Seq[Long]) = tables
+  /** The grants to any of the principals. */
+  private def reaching(principals: Seq[Principal]) = tables
     .grants
-    .filter: row =>
-      val personal = row.principalKind === Principal.personKind &&
-        row.principalId === user
-      if groups.isEmpty then personal
-      else
-        personal ||
-        (row.principalKind === Principal.groupKind &&
-        (row.principalId inSet groups))
+    .filter(heldByAny(_, principals))
 
 object GrantStore:
 
-  /**
-    * The highest of the given stored levels of access. A level this version
-    * does not recognise is ignored, so that an unreadable grant confers nothing
-    * rather than being guessed at.
-    */
+  /** The highest of the stored levels, ignoring any this version cannot read. */
   private def highest(levels: Iterable[String]): Option[Access] = levels
-    .flatMap(Access.fromName)
+    .flatMap(Access.fromCode)
     .maxOption
 
   /**
-    * The stored names of every level of access that includes the given one, for
-    * asking the database itself which grants are high enough. Levels are stored
-    * by name and compared by position, so the comparison travels as the set of
-    * names that satisfy it. A name this version does not recognise is not among
-    * them, so an unreadable grant confers nothing, exactly as in [[highest]].
+    * The stored codes of every level including the given one, so the database
+    * can compare levels stored by code.
     */
   private def atLeast(least: Access): Seq[String] = Access
     .values
     .filter(_.includes(least))
-    .map(_.name)
+    .map(_.code)
     .toSeq

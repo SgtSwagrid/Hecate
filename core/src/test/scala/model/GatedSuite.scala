@@ -50,8 +50,22 @@ class GatedSuite extends FunSuite:
     assert(unknown.as[Gated[Int]].isLeft)
 
   test("blank text is absent, and other text is shown"):
-    assertEquals(Gated.text("  "), Gated.Absent)
+    assertEquals(Gated.fromText("  "), Gated.Absent)
     assertEquals(
-      Gated.text("Sort by author."),
+      Gated.fromText("Sort by author."),
       Gated.Shown("Sort by author."),
+    )
+
+  test("mapping changes a shown part, and leaves the others as they were"):
+    val shown: Gated[Int]    = Gated.Shown(3)
+    val absent: Gated[Int]   = Gated.Absent
+    val withheld: Gated[Int] = Gated.Withheld
+    assertEquals(
+      shown.map(_.toString),
+      Gated.Shown("3"),
+    )
+    assertEquals(absent.map(_.toString), Gated.Absent)
+    assertEquals(
+      withheld.map(_.toString),
+      Gated.Withheld,
     )

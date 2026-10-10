@@ -8,15 +8,12 @@ import java.security.SecureRandom
 import slick.dbio.DBIO
 
 /**
-  * The store of invite links: each a code (see [[InviteCode]]) leading to one
-  * group or one resource. Every action here composes into the caller's
-  * transaction and opens none of its own, as who may make a link, and what must
-  * be locked meanwhile, is decided by whoever calls it: [[GroupStore]] for a
-  * group, and the host application for a resource.
+  * A store of invite links, each a code (see [[InviteCode]]) leading to a group
+  * or a resource. Every action composes into the caller's transaction.
   *
-  * At most one link leads to each group and to each resource. As for grants, no
-  * table can declare that, so it holds only while the caller locks the row of
-  * what the link leads to before changing its link, as [[GroupStore]] does.
+  * At most one link leads to each group and each resource only while the caller
+  * locks the target's row before changing its link, as [[GroupStore]] does for
+  * groups and the host must for resources.
   *
   * @param tables
   *   The tables the links are stored in.
@@ -25,26 +22,47 @@ final class LinkStore(tables: AuthTables):
 
   import tables.profile.api.*
 
-  /** The link leading to the given target, if there is one, and who made it. */
-  def to(target: LinkTarget): DBIO[Option[LinkRow]] = leadingTo(target)
+  /**
+    * Finds the link leading to a target.
+    *
+    * @param target
+    *   The group or resource the link leads to; a resource's level is ignored.
+    *
+    * @return
+    *   An action yielding the link, or `None`.
+    */
+  def to(target: LinkTarget): DBIO[Option[InviteLinkRow]] = leadingTo(target)
     .result
     .headOption
 
   /**
-    * The codes of the links to each of the given groups that has one. Never
-    * asks the database about no groups.
+    * Finds the codes of the links to some groups.
+    *
+    * @param groups
+    *   The identifiers of the groups.
+    *
+    * @return
+    *   An action yielding each linked group's identifier mapped to its code.
     */
   def toGroups(groups: Seq[Long]): DBIO[Map[Long, String]] = ifAny(groups)(
     Map.empty,
   ): shown =>
     tables
-      .links
+      .inviteLinks
       .filter(_.groupId inSet shown)
       .map(link => (link.groupId, link.code))
       .result
       .map(_.collect { case (Some(group), code) => group -> code }.toMap)
 
-  /** The link leading to the given resource, as its owners see it, if any. */
+  /**
+    * Finds the link leading to a resource, as its owners see it.
+    *
+    * @param resource
+    *   The resource the link leads to.
+    *
+    * @return
+    *   An action yielding the link, or `None`.
+    */
   def over(resource: Resource): DBIO[Option[InviteLink]] = to(
     LinkTarget.Sharing(resource, Access.View),
   ).map(_.flatMap(row =>
@@ -56,95 +74,123 @@ final class LinkStore(tables: AuthTables):
   ))
 
   /**
-    * The link with the given code, and the user who made it, if there is one.
-    * The code is read without regard to case, and text that could not be a code
-    * finds nothing without asking the database.
+    * Finds a link by its code, read in any case.
+    *
+    * @param code
+    *   The code as given.
+    *
+    * @return
+    *   An action yielding the link and the user who made it, or `None`.
     */
-  def find(code: String): DBIO[Option[(LinkRow, User)]] = InviteCode
+  def find(code: String): DBIO[Option[(InviteLinkRow, User)]] = InviteCode
     .parse(code)
     .fold(DBIO.successful(None))(known =>
       tables
-        .links
+        .inviteLinks
         .filter(_.code === known)
         .join(tables.users)
-        .on(_.creator === _.id)
+        .on(_.creatorId === _.id)
         .result
         .headOption
         .map(_.map((row, creator) => (row, creator.toUser))),
     )
 
   /**
-    * Gives the target a link unless it has one, yielding the link's code either
-    * way. A resource's link is set to the target's level of access, whatever
-    * level it granted before.
+    * Gives a target a link unless it has one. A resource's existing link is set
+    * to the target's level of access.
     *
     * @param creator
-    *   The identifier of the user making the link, should one be made.
+    *   The identifier of the user making the link, if one is made.
     *
     * @param target
-    *   Where the link leads, and for a resource what it grants.
+    *   The place the link leads, and for a resource the access it grants.
+    *
+    * @return
+    *   An action yielding the link's code.
     */
   def ensure(creator: Long, target: LinkTarget): DBIO[String] = to(target)
     .flatMap:
       case Some(row) => regrant(target).map(_ => row.code)
-      case None      => fresh(creator, target)
+      case None      => create(creator, target)
 
   /**
-    * Replaces the target's link with one of a new code, yielding that code, so
-    * that the old one stops working. Makes one if there was none.
+    * Replaces a target's link with one of a new code, or makes one.
+    *
+    * @param creator
+    *   The identifier of the user making the link.
+    *
+    * @param target
+    *   The place the link leads, and for a resource the access it grants.
+    *
+    * @return
+    *   An action yielding the new code.
     */
-  def renew(creator: Long, target: LinkTarget): DBIO[String] = remove(target)
-    .flatMap(_ => fresh(creator, target))
+  def renew(creator: Long, target: LinkTarget): DBIO[String] = delete(target)
+    .flatMap(_ => create(creator, target))
 
-  /** Turns off the link leading to the target, if there is one. */
-  def remove(target: LinkTarget): DBIO[Unit] = leadingTo(target).delete.unit
+  /**
+    * Turns off the link leading to a target.
+    *
+    * @param target
+    *   The group or resource the link leads to.
+    *
+    * @return
+    *   An action deleting the link, doing nothing if there is none.
+    */
+  def delete(target: LinkTarget): DBIO[Unit] = leadingTo(target).delete.unit
 
-  /** Turns off every link leading to any of the given groups. */
-  def removeFromGroups(groups: Seq[Long]): DBIO[Unit] = ifAny(groups)(()):
-    doomed => tables.links.filter(_.groupId inSet doomed).delete.unit
+  /**
+    * Turns off every link leading to any of some groups.
+    *
+    * @param groups
+    *   The identifiers of the groups.
+    *
+    * @return
+    *   An action deleting the links.
+    */
+  def deleteToGroups(groups: Seq[Long]): DBIO[Unit] = ifAny(groups)(()):
+    doomed => tables.inviteLinks.filter(_.groupId inSet doomed).delete.unit
 
-  /** Turns off every link made by the given user. */
-  def removeMadeBy(user: Long): DBIO[Unit] = tables
-    .links
-    .filter(_.creator === user)
+  /**
+    * Turns off every link a user made.
+    *
+    * @param user
+    *   The identifier of the user.
+    *
+    * @return
+    *   An action deleting the links.
+    */
+  def deleteMadeBy(user: Long): DBIO[Unit] = tables
+    .inviteLinks
+    .filter(_.creatorId === user)
     .delete
     .unit
 
-  /**
-    * The given action as one transaction, joining the caller's if there is one,
-    * for a service that holds no profile of its own to open one with.
-    */
+  /** Runs an action as one transaction, for services that hold no profile. */
   private[server] def atomically[X](action: DBIO[X]): DBIO[X] =
     action.transactionally
 
-  /** Sets the level of access the target's link grants, if it grants any. */
   private def regrant(target: LinkTarget): DBIO[Unit] = target match
-    case LinkTarget.Joining(_)         => DBIO.successful(())
+    case LinkTarget.Joining(_)         => DBIO.unit
     case LinkTarget.Sharing(_, access) =>
-      leadingTo(target).map(_.access).update(Some(access.name)).unit
+      leadingTo(target).map(_.access).update(Some(access.code)).unit
 
-  /**
-    * Stores a link to the target with a code no other link has, trying fresh
-    * codes until one is free. With tens of millions of codes to choose from, a
-    * second try is rare and a tenth all but impossible, so that is where it
-    * gives up rather than spinning.
-    */
-  private def fresh
+  /** Stores a link under a random free code, giving up after a few tries. */
+  private def create
     (
       creator: Long,
       target: LinkTarget,
       tries: Int = LinkStore.tries,
     )
     : DBIO[String] = DBIO
-    .successful(())
+    .unit
     .flatMap(_ => claim(LinkStore.randomCode(), creator, target))
     .flatMap:
       case Some(code)        => DBIO.successful(code)
-      case None if tries > 1 => fresh(creator, target, tries - 1)
+      case None if tries > 1 => create(creator, target, tries - 1)
       case None              =>
         DBIO.failed(IllegalStateException("No free invite code was found."))
 
-  /** Stores a link with the given code, unless the code is taken. */
   private def claim
     (
       code: String,
@@ -152,42 +198,36 @@ final class LinkStore(tables: AuthTables):
       target: LinkTarget,
     )
     : DBIO[Option[String]] = tables
-    .links
+    .inviteLinks
     .filter(_.code === code)
     .exists
     .result
     .flatMap:
       case true  => DBIO.successful(None)
-      case false =>
-        (tables.links += LinkRow.of(code, creator, target)).map(_ => Some(code))
+      case false => (tables.inviteLinks +=
+          InviteLinkRow.of(code, creator, target)).map(_ => Some(code))
 
-  /** The query for every link leading to the target, whatever it grants. */
   private def leadingTo(target: LinkTarget) = target match
-    case LinkTarget.Joining(group) => tables.links.filter(_.groupId === group)
+    case LinkTarget.Joining(group) =>
+      tables.inviteLinks.filter(_.groupId === group)
     case LinkTarget.Sharing(resource, _) => tables
-        .links
+        .inviteLinks
         .filter(link =>
           link.resourceKind === resource.kind && link.resourceId === resource.id,
         )
 
 object LinkStore:
 
-  /** How many codes are tried before giving up on finding a free one. */
   private val tries = 10
 
   private val random = SecureRandom()
 
-  /**
-    * A code chosen uniformly at random from every possible code: strings of the
-    * alphabet are drawn until one is a code, which takes one draw in most cases
-    * and more than three almost never.
-    */
+  /** A code drawn uniformly from every valid code, by rejection sampling. */
   private def randomCode(): String = Iterator
     .continually(draw())
     .find(InviteCode.valid)
     .get
 
-  /** A string of a code's length, drawn uniformly from the alphabet. */
   private def draw(): String = String(Array.fill(InviteCode.length)(
     InviteCode.alphabet(random.nextInt(InviteCode.alphabet.length)),
   ))

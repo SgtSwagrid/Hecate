@@ -1,263 +1,240 @@
 package com.alecdorrington.hecate
 package server
 
-import Fixtures.{read, register, serve, SendRequest}
-import cats.effect.IO
-import com.alecdorrington.hecate.api.AuthApi
-import com.alecdorrington.hecate.i18n.Wording
-import com.alecdorrington.hecate.model.{Credentials, User}
-import io.circe.syntax.*
+import Fixtures.cheap
+import cats.effect.{IO, Ref}
+import com.alecdorrington.hecate.api.Protocol
+import com.alecdorrington.hecate.model.{
+  AuthRefusal, AuthRules, Credentials, PasswordChange,
+}
 import munit.CatsEffectSuite
-import sttp.client3.{basicRequest, Response, UriContext}
-import sttp.model.StatusCode
 
-/**
-  * Tests of the endpoints [[AuthService]] serves, as a caller meets them: what
-  * a request answers, what it sets, and in whose language it is refused.
-  */
 class AuthServiceSuite extends CatsEffectSuite:
 
   import AuthServiceSuite.*
 
   test("registering answers the new user and opens a session"):
-    served(): call =>
+    serving(): auth =>
       for
-        registered <- call(register("alice", "hunter2222"))
-        user = read[User](registered)
-        signed <- call(me)
+        registered <- auth.register(alice)
+        (user, session) = registered.toOption.get
+        found <- auth.current(Some(session.token))
       yield
-        assertEquals(user.map(_.username), Right("alice"))
-        assert(
-          cookieOf(registered).isDefined,
-          "no session cookie was set",
-        )
-        assertEquals(signed.code, StatusCode.Ok)
-
-  test("nobody is signed in without the cookie"):
-    served(): call =>
-      call(me).map(answer => assertEquals(answer.body, Right(nobody)))
-
-  test("a session cookie signs its owner in"):
-    served(): call =>
-      for
-        opened <- call(register("alice", "hunter2222"))
-        token = cookieOf(opened).get
-        found <- call(me.cookie(AuthApi.sessionCookie, token))
-      yield assertEquals(
-        read[Option[User]](found).map(_.map(_.username)),
-        Right(Some("alice")),
-      )
-
-  test("a taken username is refused, and nothing is opened"):
-    served(): call =>
-      for
-        _     <- call(register("alice", "hunter2222"))
-        again <- call(register("alice", "different2"))
-      yield
-        assertEquals(again.code, StatusCode.BadRequest)
+        assertEquals(user.username, "alice")
+        assertEquals(session.maxAge, cheap.sessionSeconds)
         assertEquals(
-          again.body,
-          Left(Wording.english.usernameTaken),
+          found.map(_.map(_.id)),
+          Right(Some(user.id)),
         )
-        assertEquals(cookieOf(again), None)
+
+  test("nobody is signed in without a session"):
+    serving(): auth =>
+      for
+        current  <- auth.current(None)
+        signedIn <- auth.signedIn(None)
+      yield
+        assertEquals(current, Right(None))
+        assertEquals(signedIn, Left(AuthRefusal.SignedOut))
+
+  test("a taken username is refused"):
+    serving(): auth =>
+      for
+        _     <- auth.register(alice)
+        again <- auth.register(Credentials("alice", "different2"))
+      yield assertEquals(again, Left(AuthRefusal.UsernameTaken))
+
+  test("a username differing from a taken one only in case is refused"):
+    serving(): auth =>
+      for
+        _     <- auth.register(alice)
+        again <- auth.register(Credentials("ALICE", "different2"))
+      yield assertEquals(again, Left(AuthRefusal.UsernameTaken))
+
+  test("signing in ignores the username's letter case"):
+    serving(): auth =>
+      for
+        made   <- auth.register(Credentials("Alice", "hunter2222"))
+        signed <- auth.signIn(Credentials("aLiCe", "hunter2222"))
+      yield assertEquals(signed.map(_._1), made.map(_._1))
 
   test("a password shorter than the policy allows is refused"):
-    served(): call =>
-      call(register("alice", "short")).map(answer =>
-        assertEquals(
-          answer.body,
-          Left(Wording.english.passwordTooShort(8)),
-        ),
-      )
+    serving(): auth =>
+      auth
+        .register(Credentials("alice", "short"))
+        .map(answer =>
+          assertEquals(
+            answer,
+            Left(AuthRefusal.PasswordTooShort(8)),
+          ),
+        )
 
   test("a blank username is refused"):
-    served(): call =>
-      call(register("   ", "hunter2222")).map(answer =>
-        assertEquals(
-          answer.body,
-          Left(Wording.english.emptyUsername),
-        ),
-      )
+    serving(): auth =>
+      auth
+        .register(Credentials("   ", "hunter2222"))
+        .map(answer =>
+          assertEquals(
+            answer,
+            Left(AuthRefusal.UsernameEmpty),
+          ),
+        )
 
-  test("signing in needs the right password"):
-    served(): call =>
+  test("text longer than the protocol allows is refused, and never stored"):
+    serving(): auth =>
+      val name     = "a" * (Protocol.maxNameLength + 1)
+      val password = "a" * (Protocol.maxPasswordLength + 1)
       for
-        _     <- call(register("alice", "hunter2222"))
-        wrong <- call(login("alice", "hunter3333"))
-        right <- call(login("alice", "hunter2222"))
+        longName     <- auth.register(Credentials(name, "hunter2222"))
+        longPassword <- auth.signIn(Credentials("alice", password))
+        found        <- auth.signIn(Credentials(name, "hunter2222"))
       yield
         assertEquals(
-          wrong.body,
-          Left(Wording.english.incorrectCredentials),
+          longName,
+          Left(AuthRefusal.TooLong(Protocol.maxNameLength)),
         )
-        assertEquals(cookieOf(wrong), None)
+        assertEquals(
+          longPassword,
+          Left(AuthRefusal.TooLong(Protocol.maxPasswordLength)),
+        )
         assert(
-          cookieOf(right).isDefined,
-          "a correct sign-in opened nothing",
+          found.isLeft,
+          "an over-long username was registered",
         )
 
-  /**
-    * A password stored under fewer rounds than the policy asks for is derived
-    * again under the policy's count when its owner signs in, and one stored
-    * under as many is left alone: never under the library's own default, which
-    * would override the host's choice either way.
-    */
-  test("signing in derives a password again under the policy's rounds alone"):
+  test("signing in needs the right password"):
+    serving(): auth =>
+      for
+        _     <- auth.register(alice)
+        wrong <- auth.signIn(Credentials("alice", "hunter3333"))
+        right <- auth.signIn(alice)
+      yield
+        assertEquals(
+          wrong,
+          Left(AuthRefusal.CredentialsIncorrect),
+        )
+        assert(
+          right.isRight,
+          "a correct sign-in was refused",
+        )
+
+  test(
+    "signing in derives a password again under the policy's iterations alone",
+  ):
     TestDb
-      .users(s"auth-rehash-${ java.util.UUID.randomUUID }")
+      .users("auth-rehash")
       .use: users =>
-        val rounds = users
+        def hashingAt(iterations: Int) = AuthService(
+          users,
+          AuthPolicy(hashIterations = iterations),
+        )
+        val stored = users
           .findByUsername("alice")
-          .map(_.map(_.passwordHash.takeWhile(_ != ':')))
+          .map(_.flatMap(_.passwordHash).map(_.takeWhile(_ != ':')))
         for
-          _      <- hashingAt(users, 1000)(register("alice", "hunter2222"))
-          _      <- hashingAt(users, 1000)(login("alice", "hunter2222"))
-          kept   <- rounds
-          _      <- hashingAt(users, 2000)(login("alice", "hunter2222"))
-          raised <- rounds
+          _      <- hashingAt(1000).register(alice)
+          _      <- hashingAt(1000).signIn(alice)
+          kept   <- stored
+          _      <- hashingAt(2000).signIn(alice)
+          raised <- stored
         yield
           assertEquals(kept, Some("1000"))
           assertEquals(raised, Some("2000"))
 
   test("an unknown username is refused exactly as a wrong password is"):
-    served(): call =>
+    serving(): auth =>
       for
-        _       <- call(register("alice", "hunter2222"))
-        unknown <- call(login("nobody", "hunter2222"))
-        wrong   <- call(login("alice", "hunter3333"))
-      yield assertEquals(unknown.body, wrong.body)
+        _       <- auth.register(alice)
+        unknown <- auth.signIn(Credentials("nobody", "hunter2222"))
+        wrong   <- auth.signIn(Credentials("alice", "hunter3333"))
+      yield assertEquals(unknown, wrong)
 
-  test("signing out closes the session it was given"):
-    served(): call =>
+  test("signing out closes the session it was given, and clears the cookie"):
+    serving(): auth =>
       for
-        opened <- call(register("alice", "hunter2222"))
-        token = cookieOf(opened).get
-        _ <- call(
-          basicRequest
-            .post(uri"http://test/api/auth/logout")
-            .cookie(AuthApi.sessionCookie, token),
+        registered <- auth.register(alice)
+        token = registered.toOption.get._2.token
+        closed <- auth.signOut(Some(token))
+        after  <- auth.current(Some(token))
+      yield
+        assertEquals(closed, Right(SessionCookie.closed))
+        assertEquals(after, Right(None))
+
+  test("a new password closes every session and opens a fresh one"):
+    serving(): auth =>
+      for
+        registered <- auth.register(alice)
+        (user, first) = registered.toOption.get
+        second  <- auth.signIn(alice)
+        changed <- auth.changePassword(
+          user,
+          PasswordChange("hunter2222", "hunter3333"),
         )
-        after <- call(me.cookie(AuthApi.sessionCookie, token))
-      yield assertEquals(after.body, Right(nobody))
-
-  test("an endpoint that needs a user refuses when there is none"):
-    served(): call =>
-      call(basicRequest.get(uri"http://test/api/auth/recovery-codes")).map(
-        answer =>
-          assertEquals(
-            answer.body,
-            Left(Wording.english.signedOut),
-          ),
-      )
-
-  test("a refusal is worded in the language the request asks for"):
-    served(wording =
-      locale => if locale.contains("de") then German else Wording.english,
-    ): call =>
-      for
-        _      <- call(register("alice", "hunter2222"))
-        german <- call(
-          register("alice", "hunter2222").cookie(AuthApi.languageCookie, "de"),
+        firstNow  <- auth.current(Some(first.token))
+        secondNow <- auth.current(Some(second.toOption.get._2.token))
+        fresh     <- auth.current(changed.map(_.token).toOption)
+      yield
+        assertEquals(firstNow, Right(None))
+        assertEquals(secondNow, Right(None))
+        assertEquals(
+          fresh.map(_.map(_.id)),
+          Right(Some(user.id)),
         )
-      yield assertEquals(
-        german.body,
-        Left(German.usernameTaken),
-      )
 
   test("the rules say what the policy is, and whether accounts can be deleted"):
-    served(): call =>
-      call(basicRequest.get(uri"http://test/api/auth/rules")).map(answer =>
-        assertEquals(
-          answer.body,
-          Right("""{"minPasswordLength":8,"accountDeletion":false}"""),
-        ),
+    serving(): auth =>
+      IO(assertEquals(
+        auth.rules,
+        AuthRules(8, false, false, false),
+      ))
+
+  test("an account is not deleted without a store to delete it"):
+    serving(): auth =>
+      for
+        registered <- auth.register(alice)
+        deleted    <- auth.deleteAccount(
+          registered.toOption.get._1,
+          "hunter2222",
+        )
+      yield assertEquals(
+        deleted,
+        Left(AuthRefusal.NoAccountDeletion),
       )
 
-  test("account deletion is not served at all without a store for it"):
-    served(): call =>
-      call(
-        basicRequest
-          .post(uri"http://test/api/auth/account/delete")
-          .body("""{"password":"hunter2222"}"""),
-      ).map(answer => assertEquals(answer.code, StatusCode.NotFound))
+  test("a failure that is not the user's is reported, and answered as such"):
+    for
+      reported <- Ref.of[IO, List[Throwable]](Nil)
+      answer   <- TestDb
+        .open("auth-failed")
+        .use(db => IO.pure(db))
+        .flatMap(closed =>
+          AuthService(
+            UserStore(TestDb.tables, closed),
+            cheap,
+            report = error => reported.update(error :: _),
+          ).current(Some("token")),
+        )
+      errors <- reported.get
+    yield
+      assertEquals(answer, Left(AuthRefusal.Failed))
+      assertEquals(errors.size, 1)
+
+  test("a session cookie is set for the whole site, and kept from scripts"):
+    val cookie = SessionCookie("abc", 60)
+    assertEquals(
+      cookie.header,
+      s"${ Protocol.sessionCookie }=abc; Max-Age=60; Path=/; HttpOnly; " +
+        "SameSite=Strict",
+    )
+    assert(
+      !cookie.toString.contains("abc"),
+      "the token was written out",
+    )
 
 object AuthServiceSuite:
 
-  /** A second language, for checking that a refusal is worded in one. */
-  private object German extends Wording:
+  private val alice = Credentials("alice", "hunter2222")
 
-    override val signedOut: String            = "Anmeldung erforderlich."
-    override val usernameTaken: String        = "Dieser Name ist vergeben."
-    override val incorrectCredentials: String = "Name oder Passwort falsch."
-    override val incorrectPassword: String    = "Passwort falsch."
-    override val incorrectRecovery: String    = "Name oder Code falsch."
-    override val noAccountDeletion: String    = "Konten bleiben bestehen."
-    override val emptyUsername: String        = "Name fehlt."
-    override val groupMissing: String         = "Gruppe nicht vorhanden."
-    override val invitationMissing: String    = "Einladung nicht vorhanden."
-    override val requestMissing: String       = "Anfrage nicht vorhanden."
-    override val linkMissing: String          = "Link ungültig."
-    override val parentGroupMissing: String   = "Obergruppe nicht vorhanden."
-    override val groupInsideItself: String    = "Gruppe in sich selbst."
-    override val requestFailed: String        = "Anfrage fehlgeschlagen."
-    override val unreadableReply: String      = "Antwort unlesbar."
-    override val unreachable: String          = "Server nicht erreichbar."
-    override val passwordChanged: String      = "Passwort geändert."
-
-    override def passwordTooShort(min: Int): String =
-      s"Passwort braucht $min Zeichen."
-
-    override def noSuchUser(username: String): String =
-      s"Niemand heißt \"$username\"."
-
-    override def soleOwner(count: Int): String =
-      s"Alleiniger Eigentümer von $count Dingen."
-
-  /** A request signing into one account. */
-  private def login(username: String, password: String) = basicRequest
-    .post(uri"http://test/api/auth/login")
-    .body(Credentials(username, password).asJson.noSpaces)
-
-  /** A request asking who is signed in. */
-  private val me = basicRequest.get(uri"http://test/api/auth/me")
-
-  /**
-    * What the body of a reply naming nobody looks like. Tapir sends an absent
-    * optional body as no body at all, rather than as `null`.
-    */
-  private val nobody = ""
-
-  /** The session cookie one answer sets, if it set one to anything. */
-  private def cookieOf(answer: Response[?]): Option[String] = answer
-    .unsafeCookies
-    .find(_.name == AuthApi.sessionCookie)
-    .map(_.value)
-    .filter(_.nonEmpty)
-
-  /**
-    * Serves the endpoints of a service over the given store, deriving passwords
-    * under the given number of rounds.
-    */
-  private def hashingAt(users: UserStore, rounds: Int): SendRequest = serve(
-    AuthService(
-      users,
-      AuthPolicy(hashingRounds = rounds),
-    ).api,
-  )
-
-  /**
-    * Runs a check against the endpoints of a service over a fresh database,
-    * served in memory rather than over a socket.
-    *
-    * @param wording
-    *   The wording refusals are written in.
-    *
-    * @param check
-    *   The check, given a way to send one request.
-    */
-  private def served
-    (wording: Option[String] => Wording = _ => Wording.english)
-    (check: SendRequest => IO[Unit])
-    : IO[Unit] = TestDb
-    .users(s"auth-service-${ java.util.UUID.randomUUID }")
-    .use(users => check(serve(AuthService(users, wording = wording).api)))
+  /** Runs a check against a fresh service, hashing under few iterations. */
+  private def serving()(check: AuthService => IO[Unit]): IO[Unit] = TestDb
+    .users("auth-service")
+    .use(users => check(AuthService(users, cheap)))

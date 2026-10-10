@@ -1,14 +1,9 @@
 package com.alecdorrington.hecate
 package client
 
-import com.alecdorrington.hecate.model.{Group, GroupView, User}
+import com.alecdorrington.hecate.model.{Access, Group, ManagedGroup, User}
 import munit.FunSuite
 
-/**
-  * Tests of how a flat list of groups is rebuilt into the hierarchy a view
-  * renders. The server sends the list flat, so this is where nesting is
-  * decided, and it is pure.
-  */
 class GroupsStateSuite extends FunSuite:
 
   import GroupsStateSuite.*
@@ -67,7 +62,7 @@ class GroupsStateSuite extends FunSuite:
     )
     assertEquals(shown.distinct.size, shown.size)
 
-  test("a tree ranks each group by its depth, in depth-first order"):
+  test("a tree outlines each group with its depth, in depth-first order"):
     val forest = GroupsState.nest(List(
       view(1, "Sales"),
       view(2, "Retail", parent = 1),
@@ -75,7 +70,7 @@ class GroupsStateSuite extends FunSuite:
       view(4, "Wholesale", parent = 1),
     ))
     assertEquals(
-      forest.head.ranked().map((group, depth) => (group.group.name, depth)),
+      forest.head.outline().map((group, depth) => (group.group.name, depth)),
       List(
         ("Sales", 0),
         ("Retail", 1),
@@ -101,8 +96,8 @@ class GroupsStateSuite extends FunSuite:
     )
 
   test("a cycle buries no group, and does not spin"):
-    // No path through the server can store this, and the client must not be
-    // the thing that loses a group if one ever arrives.
+    // The server never stores a cycle, but the client must not lose a group to
+    // one.
     val forest = GroupsState.nest(List(
       view(1, "Sales", parent = 2),
       view(2, "Retail", parent = 1),
@@ -126,7 +121,6 @@ object GroupsStateSuite:
   private val bob   = User(2, "bob")
   private val carol = User(3, "carol")
 
-  /** One group as its owner sees it, for building a list to nest. */
   private def view
     (
       id: Long,
@@ -135,16 +129,16 @@ object GroupsStateSuite:
       members: List[User] = List.empty,
       invitees: List[User] = List.empty,
     )
-    : GroupView = GroupView(
+    : ManagedGroup = ManagedGroup(
     Group(
       id,
       name,
       Option.when(parent != 0)(parent),
     ),
+    Access.Own,
     members,
     invitees,
   )
 
-  /** The names of the given groups, in the order they are in. */
   private def names(forest: List[GroupTree]): List[String] =
     forest.map(_.view.group.name)

@@ -4,29 +4,25 @@ package server
 import com.alecdorrington.hecate.model.{
   Access, Grant, Group, LinkTarget, Principal, Resource, User,
 }
+import java.util.Locale
 import slick.jdbc.{JdbcCapabilities, JdbcProfile}
 import slick.jdbc.meta.MTable
 
 /**
-  * The tables this library stores its users, sessions and groups in, defined
-  * against whichever JDBC profile the host application uses rather than a fixed
-  * one. Create an instance with the application's own profile and share it
-  * between the stores.
+  * A definition of the tables this library stores its data in, against the
+  * host's JDBC profile. Create one instance and share it between the stores.
   *
-  * No table declares a composite primary key or a foreign key. Where a
-  * composite key would otherwise apply, the stores maintain uniqueness
-  * themselves, under the row locks described on [[GroupStore]]. A table's
-  * indexes and keys are created with the table itself, and so exactly once: see
-  * [[createIfNotExists]].
+  * No table declares a composite primary key or a foreign key: the stores
+  * maintain uniqueness themselves, under the row locks described on
+  * [[GroupStore]]. Indexes are created with their table, and so only once (see
+  * [[createIfNotExists]]).
   *
   * @param profile
-  *   The Slick profile of the host application's database.
+  *   The Slick profile of the host's database.
   *
   * @param prefix
-  *   Prepended to every table name, for applications that need this library's
-  *   tables to sit in a namespace of their own. It goes into the identifiers
-  *   themselves, so it must be a constant the application chooses, never
-  *   anything that arrived in a request.
+  *   The prefix of every table name. It goes into the SQL identifiers, so it
+  *   must be a constant of the host's choosing, never request data.
   */
 final class AuthTables
   (
@@ -36,56 +32,66 @@ final class AuthTables
 
   import profile.api.*
 
-  /**
-    * One registered user. The password column holds a salted hash in the format
-    * produced by [[Passwords]], never a password.
-    */
+  /** A table of users, with the columns of [[UserRow]]. */
   final class Users(tag: Tag) extends Table[UserRow](tag, s"${ prefix }users"):
 
     def id           = column[Long]("id", O.PrimaryKey, O.AutoInc)
-    def username     = column[String]("username", O.Unique)
-    def passwordHash = column[String]("password")
+    def username     = column[String]("username")
+    def usernameKey  = column[String]("username_key", O.Unique)
+    def passwordHash = column[Option[String]]("password_hash")
+    def email        = column[Option[String]]("email")
 
-    override def * = (id, username, passwordHash).mapTo[UserRow]
+    def byEmail = index(s"${ prefix }users_email", email)
 
-  /**
-    * One sign-in session, expiring at a time this library enforces itself. The
-    * column holds the hash of the token, never the token; it keeps its name so
-    * that a database created by an earlier version goes on working, with its
-    * sessions simply no longer resolving.
-    */
+    /** The key is written from the username, so it can never disagree. */
+    override def * = (id, username, usernameKey, passwordHash, email).<>(
+      (id, username, _, passwordHash, email) =>
+        UserRow(id, username, passwordHash, email),
+      row =>
+        Some((
+          row.id,
+          row.username,
+          Username.key(row.username),
+          row.passwordHash,
+          row.email,
+        )),
+    )
+
+  /** A table of sign-in sessions, with the columns of [[SessionRow]]. */
   final class Sessions
     (tag: Tag)
     extends Table[SessionRow](tag, s"${ prefix }sessions"):
 
-    def tokenHash = column[String]("token", O.PrimaryKey)
+    def tokenHash = column[String]("token_hash", O.PrimaryKey)
     def userId    = column[Long]("user_id")
-    def expires   = column[Long]("expires")
+    def expiresAt = column[Long]("expires_at")
 
-    def bySession = index(s"${ prefix }sessions_user", userId)
+    def byUser = index(s"${ prefix }sessions_user", userId)
 
-    def byExpiry = index(s"${ prefix }sessions_expiry", expires)
+    def byExpiry = index(s"${ prefix }sessions_expiry", expiresAt)
 
-    override def * = (tokenHash, userId, expires).mapTo[SessionRow]
+    override def * = (tokenHash, userId, expiresAt).mapTo[SessionRow]
 
-  /** One user group, nested inside another via its `parent` column. */
+  /** A table of user groups, with the columns of [[GroupRow]]. */
   final class Groups
     (tag: Tag)
     extends Table[GroupRow](tag, s"${ prefix }user_groups"):
 
-    def id     = column[Long]("id", O.PrimaryKey, O.AutoInc)
-    def owner  = column[Long]("owner")
-    def name   = column[String]("name")
-    def parent = column[Option[Long]]("parent")
-    def public = column[Boolean]("is_public")
+    def id       = column[Long]("id", O.PrimaryKey, O.AutoInc)
+    def name     = column[String]("name")
+    def parentId = column[Option[Long]]("parent_id")
+    def public   = column[Boolean]("public")
 
-    def byOwner = index(s"${ prefix }groups_owner", owner)
+    def byParent = index(
+      s"${ prefix }user_groups_parent",
+      parentId,
+    )
 
-    def byPublic = index(s"${ prefix }groups_public", public)
+    def byPublic = index(s"${ prefix }user_groups_public", public)
 
-    override def * = (id, owner, name, parent, public).mapTo[GroupRow]
+    override def * = (id, name, parentId, public).mapTo[GroupRow]
 
-  /** One user's membership of one group. */
+  /** A table of group memberships, with the columns of [[MemberRow]]. */
   final class Members
     (tag: Tag)
     extends Table[MemberRow](tag, s"${ prefix }group_members"):
@@ -94,33 +100,37 @@ final class AuthTables
     def userId  = column[Long]("user_id")
 
     def byGroup = index(
-      s"${ prefix }members_group",
+      s"${ prefix }group_members_group",
       (groupId, userId),
     )
 
-    def byMember = index(s"${ prefix }members_user", userId)
+    def byUser = index(s"${ prefix }group_members_user", userId)
 
     override def * = (groupId, userId).mapTo[MemberRow]
 
-  /** One pending invitation of one user to one group. */
+  /** A table of group invitations, with the columns of [[InvitationRow]]. */
   final class Invitations
     (tag: Tag)
     extends Table[InvitationRow](tag, s"${ prefix }group_invitations"):
 
-    def id      = column[Long]("id", O.PrimaryKey, O.AutoInc)
-    def groupId = column[Long]("group_id")
-    def userId  = column[Long]("user_id")
+    def id        = column[Long]("id", O.PrimaryKey, O.AutoInc)
+    def groupId   = column[Long]("group_id")
+    def userId    = column[Long]("user_id")
+    def inviterId = column[Long]("inviter_id")
 
     def byGroup = index(
-      s"${ prefix }invitations_group",
+      s"${ prefix }group_invitations_group",
       (groupId, userId),
     )
 
-    def byInvitee = index(s"${ prefix }invitations_user", userId)
+    def byUser = index(
+      s"${ prefix }group_invitations_user",
+      userId,
+    )
 
-    override def * = (id, groupId, userId).mapTo[InvitationRow]
+    override def * = (id, groupId, userId, inviterId).mapTo[InvitationRow]
 
-  /** One user's pending request to join one group. */
+  /** A table of requests to join a group, with the columns of [[RequestRow]]. */
   final class Requests
     (tag: Tag)
     extends Table[RequestRow](tag, s"${ prefix }group_requests"):
@@ -129,50 +139,54 @@ final class AuthTables
     def userId  = column[Long]("user_id")
 
     def byGroup = index(
-      s"${ prefix }requests_group",
+      s"${ prefix }group_requests_group",
       (groupId, userId),
     )
 
-    def byApplicant = index(s"${ prefix }requests_user", userId)
+    def byUser = index(
+      s"${ prefix }group_requests_user",
+      userId,
+    )
 
     override def * = (groupId, userId).mapTo[RequestRow]
 
-  /**
-    * One invite link, known by its code, leading either to a group or to a
-    * resource with a level of access: the one kind's columns are filled and the
-    * other's empty. At most one link exists per group and per resource,
-    * maintained by [[LinkStore]].
-    */
-  final class Links
+  /** A table of invite links, with the columns of [[InviteLinkRow]]. */
+  final class InviteLinks
     (tag: Tag)
-    extends Table[LinkRow](tag, s"${ prefix }invite_links"):
+    extends Table[InviteLinkRow](tag, s"${ prefix }invite_links"):
 
     def code         = column[String]("code", O.PrimaryKey)
-    def creator      = column[Long]("creator")
+    def creatorId    = column[Long]("creator_id")
     def groupId      = column[Option[Long]]("group_id")
     def resourceKind = column[Option[String]]("resource_kind")
     def resourceId   = column[Option[Long]]("resource_id")
     def access       = column[Option[String]]("access")
 
-    def byGroup = index(s"${ prefix }links_group", groupId)
+    def byGroup = index(
+      s"${ prefix }invite_links_group",
+      groupId,
+    )
 
     def byResource = index(
-      s"${ prefix }links_resource",
+      s"${ prefix }invite_links_resource",
       (resourceKind, resourceId),
     )
 
-    def byCreator = index(s"${ prefix }links_creator", creator)
+    def byCreator = index(
+      s"${ prefix }invite_links_creator",
+      creatorId,
+    )
 
-    override def * = (code, creator, groupId, resourceKind, resourceId, access)
-      .mapTo[LinkRow]
+    override def * = (
+      code,
+      creatorId,
+      groupId,
+      resourceKind,
+      resourceId,
+      access,
+    ).mapTo[InviteLinkRow]
 
-  /**
-    * One principal's access to one resource. Resources are named by a kind and
-    * identifier of the host application's choosing, and principals and levels
-    * of access by their explicitly spelled names, so nothing here depends on a
-    * position or a Scala identifier. At most one row exists per principal per
-    * resource, maintained by [[GrantStore]].
-    */
+  /** A table of grants, with the columns of [[GrantRow]]. */
   final class Grants
     (tag: Tag)
     extends Table[GrantRow](tag, s"${ prefix }grants"):
@@ -203,8 +217,8 @@ final class AuthTables
       access,
     ).mapTo[GrantRow]
 
-  /** One unused recovery code of one user, stored only as a hash. */
-  final class Codes
+  /** A table of unused recovery codes, with the columns of [[RecoveryCodeRow]]. */
+  final class RecoveryCodes
     (tag: Tag)
     extends Table[RecoveryCodeRow](tag, s"${ prefix }recovery_codes"):
 
@@ -212,76 +226,143 @@ final class AuthTables
     def userId   = column[Long]("user_id")
     def codeHash = column[String]("code_hash")
 
-    def byOwner = index(s"${ prefix }codes_user", userId)
+    def byUser = index(
+      s"${ prefix }recovery_codes_user",
+      userId,
+    )
 
     override def * = (id, userId, codeHash).mapTo[RecoveryCodeRow]
 
-  /** The query for the table of registered users. */
+  /** A table of links sent by email, with the columns of [[EmailLinkRow]]. */
+  final class EmailLinks
+    (tag: Tag)
+    extends Table[EmailLinkRow](tag, s"${ prefix }email_links"):
+
+    def tokenHash = column[String]("token_hash", O.PrimaryKey)
+    def userId    = column[Long]("user_id")
+    def purpose   = column[String]("purpose")
+    def address   = column[String]("address")
+    def sentAt    = column[Long]("sent_at")
+    def expiresAt = column[Long]("expires_at")
+
+    def byUser = index(s"${ prefix }email_links_user", userId)
+
+    def byExpiry = index(
+      s"${ prefix }email_links_expiry",
+      expiresAt,
+    )
+
+    override def * = (tokenHash, userId, purpose, address, sentAt, expiresAt)
+      .mapTo[EmailLinkRow]
+
+  /**
+    * A table of mails sent with links, kept for a day to limit how many are
+    * sent (see [[UserStore.issueLink]]), with the columns of [[SentMailRow]].
+    */
+  final class SentMails
+    (tag: Tag)
+    extends Table[SentMailRow](tag, s"${ prefix }sent_mails"):
+
+    def id      = column[Long]("id", O.PrimaryKey, O.AutoInc)
+    def userId  = column[Long]("user_id")
+    def purpose = column[String]("purpose")
+    def address = column[String]("address")
+    def sentAt  = column[Long]("sent_at")
+
+    def byUser = index(s"${ prefix }sent_mails_user", userId)
+
+    def byAddress = index(
+      s"${ prefix }sent_mails_address",
+      address,
+    )
+
+    def bySent = index(s"${ prefix }sent_mails_sent", sentAt)
+
+    override def * = (id, userId, purpose, address, sentAt).mapTo[SentMailRow]
+
+  /** The table of users. */
   val users = TableQuery[Users]
 
-  /** The query for the table of sign-in sessions. */
+  /** The table of sign-in sessions. */
   val sessions = TableQuery[Sessions]
 
-  /** The query for the table of user groups. */
+  /** The table of user groups. */
   val groups = TableQuery[Groups]
 
-  /** The query for the table of group memberships. */
+  /** The table of group memberships. */
   val members = TableQuery[Members]
 
-  /** The query for the table of group invitations. */
+  /** The table of group invitations. */
   val invitations = TableQuery[Invitations]
 
-  /** The query for the table of requests to join a group. */
+  /** The table of requests to join a group. */
   val requests = TableQuery[Requests]
 
-  /** The query for the table of invite links. */
-  val links = TableQuery[Links]
+  /** The table of invite links. */
+  val inviteLinks = TableQuery[InviteLinks]
 
-  /** The query for the table of grants. */
+  /** The table of grants. */
   val grants = TableQuery[Grants]
 
-  /** The query for the table of unused recovery codes. */
-  val recoveryCodes = TableQuery[Codes]
+  /** The table of unused recovery codes. */
+  val recoveryCodes = TableQuery[RecoveryCodes]
 
-  /** Whether the database can lock the rows a query reads. */
-  private val canLock = profile
+  /** The table of links sent by email. */
+  val emailLinks = TableQuery[EmailLinks]
+
+  /** The table of mails sent with links. */
+  val sentMails = TableQuery[SentMails]
+
+  private val lockable = profile
     .capabilities
     .contains(JdbcCapabilities.forUpdate)
 
   /**
-    * The given query, locking the rows it reads until the transaction ends,
-    * where the database can. Every row lock the stores take goes through here,
-    * never through `forUpdate` itself: a profile without the capability still
-    * writes `FOR UPDATE` when asked, and SQLite, the one such database Slick
-    * supports, then refuses the whole statement. It lets only one writer in at
-    * a time anyway, so skipping the lock there loses nothing.
+    * Locks the rows a query reads until the transaction ends, where the
+    * database can. Always lock through this, never `forUpdate`: SQLite refuses
+    * `FOR UPDATE`, and admits only one writer anyway.
     */
   private[server] def locked[E, U](query: Query[E, U, Seq]): Query[E, U, Seq] =
-    if canLock then query.forUpdate else query
+    if lockable then query.forUpdate else query
 
   /**
-    * Creates any of this library's tables that the database does not already
-    * have, each with its indexes, and leaves every table it does have exactly
-    * as it is. Safe to run on every startup, and alongside the host
-    * application's own schema creation. There are no migrations: a table whose
-    * shape has changed since an older database was created is not altered, so
-    * such a database must be recreated.
+    * Reads one user's row, locking it until the transaction ends, where the
+    * database can.
     *
-    * Which tables are missing is asked of the database's own metadata, rather
-    * than left to `CREATE TABLE IF NOT EXISTS`, because that guards only the
-    * table: Slick emits an index, a composite key or a foreign key as a
-    * statement of its own, which a second startup would replay and fail on.
+    * @param id
+    *   The user's identifier.
+    *
+    * @return
+    *   An action reading the user's row, if they exist.
+    */
+  def lockUser(id: Long): DBIO[Option[UserRow]] =
+    locked(users.filter(_.id === id)).result.headOption
+
+  /**
+    * Creates each of this library's tables the database lacks, with its
+    * indexes, leaving existing tables untouched; safe on every startup. There
+    * are no migrations: a table whose shape changed is not altered.
+    *
+    * Missing tables are found in the database's metadata, as
+    * `CREATE TABLE IF NOT EXISTS` guards only the table, and Slick's separate
+    * index statements would fail on a second startup.
     */
   def createIfNotExists: DBIO[Unit] = MTable
     .getTables
-    .flatMap(held => DBIO.seq(absent(held.map(_.name.name.toLowerCase).toSet)*))
+    .flatMap: held =>
+      val names = held.map(_.name.name.toLowerCase(Locale.ROOT)).toSet
+      DBIO.seq(createMissing(names)*)
 
-  /** Creates each of this library's tables that is not among the given names. */
-  private def absent(held: Set[String]): Seq[DBIO[Unit]] = tables
-    .filterNot(table => held(table.baseTableRow.tableName.toLowerCase))
+  /**
+    * Creates the tables not among the given lower-case names. Case is folded by
+    * `Locale.ROOT`, so that a Turkish locale does not lower `I` to `ı`.
+    */
+  private def createMissing(held: Set[String]): Seq[DBIO[Unit]] = tables
+    .filterNot(table =>
+      held(table.baseTableRow.tableName.toLowerCase(Locale.ROOT)),
+    )
     .map(_.schema.create)
 
-  /** Every table this library stores its data in. */
   private def tables: Seq[TableQuery[? <: Table[?]]] = Seq(
     users,
     sessions,
@@ -289,122 +370,130 @@ final class AuthTables
     members,
     invitations,
     requests,
-    links,
+    inviteLinks,
     grants,
     recoveryCodes,
+    emailLinks,
+    sentMails,
   )
 
 /**
-  * One registered user, flattened into a database row.
+  * A stored user, registered or a guest.
   *
   * @param id
-  *   The unique identifier of this user, assigned by the database.
+  *   The identifier, assigned by the database.
   *
   * @param username
-  *   The unique name this user signs in with.
+  *   The name the user signs in with, unique whatever its letter case, as
+  *   [[Username.key]] folds it.
   *
   * @param passwordHash
-  *   The salted hash of this user's password, in the format produced by
-  *   [[Passwords]].
+  *   The password's hash as [[Passwords]] makes it, or `None` for a guest.
+  *
+  * @param email
+  *   The confirmed email address, as [[EmailAddress.normalise]] writes it, or
+  *   `None`. Several users may share one.
   */
 final case class UserRow
   (
     id: Long,
     username: String,
-    passwordHash: String,
+    passwordHash: Option[String],
+    email: Option[String],
   ):
 
-  /** Restores the user stored in this row, without their password hash. */
-  def toUser: User = User(id, username)
+  /** The user this row stores, without the password hash. */
+  def toUser: User = User(id, username, passwordHash.isEmpty)
 
 /**
-  * One sign-in session, flattened into a database row.
+  * A stored sign-in session.
   *
   * @param tokenHash
-  *   The hash of the secret bearer token held in the browser's session cookie,
-  *   as [[Digest]] produces it. The token itself is never stored, so a stolen
-  *   copy of this table is not a set of usable sessions.
+  *   The session token's hash as [[Digest]] makes it; the token itself is never
+  *   stored.
   *
   * @param userId
   *   The identifier of the signed-in user.
   *
-  * @param expires
-  *   When this session stops being accepted, in epoch milliseconds. Enforced
-  *   server-side, so that a leaked token does not outlive it however long the
-  *   browser chooses to keep the cookie.
+  * @param expiresAt
+  *   The time the session stops being accepted, in milliseconds since the
+  *   epoch, enforced however long the browser keeps the cookie.
   */
 final case class SessionRow
   (
     tokenHash: String,
     userId: Long,
-    expires: Long,
+    expiresAt: Long,
   )
 
 /**
-  * One user group, flattened into a database row.
+  * A stored user group.
   *
   * @param id
-  *   The unique identifier of this group, assigned by the database.
-  *
-  * @param owner
-  *   The identifier of the user who created, and therefore manages, this group.
+  *   The identifier, assigned by the database.
   *
   * @param name
-  *   The display name of this group.
+  *   The display name.
   *
-  * @param parent
-  *   The identifier of the group this group is nested inside, or `None` for a
-  *   top-level group. Always a group of the same owner.
+  * @param parentId
+  *   The identifier of the group this one is nested inside, or `None` for a
+  *   top-level group.
   *
   * @param public
-  *   Whether everyone can find this group and ask to join it.
+  *   Whether everyone can find the group and ask to join it.
   */
 final case class GroupRow
   (
     id: Long,
-    owner: Long,
     name: String,
-    parent: Option[Long],
+    parentId: Option[Long],
     public: Boolean = false,
   ):
 
-  /** Restores the group stored in this row. */
-  def toGroup: Group = Group(id, name, parent, public)
+  /** The group this row stores. */
+  def toGroup: Group = Group(id, name, parentId, public)
 
 /**
-  * One user's membership of one group, flattened into a database row.
+  * A stored membership of a group.
   *
   * @param groupId
   *   The identifier of the group.
   *
   * @param userId
-  *   The identifier of the enrolled user.
+  *   The identifier of the member.
   */
 final case class MemberRow(groupId: Long, userId: Long)
 
 /**
-  * One pending invitation of one user to one group, flattened into a database
-  * row. At most one exists per user per group, maintained by [[GroupStore]]. An
-  * invitation is deleted once accepted or declined.
+  * A stored pending invitation to a group, at most one per user per group,
+  * deleted once accepted or declined.
   *
   * @param id
-  *   The unique identifier of this invitation, assigned by the database.
+  *   The identifier, assigned by the database.
   *
   * @param groupId
-  *   The identifier of the group the user is invited to.
+  *   The identifier of the group.
   *
   * @param userId
   *   The identifier of the invited user.
+  *
+  * @param inviterId
+  *   The identifier of the user who sent the invitation.
   */
-final case class InvitationRow(id: Long, groupId: Long, userId: Long)
+final case class InvitationRow
+  (
+    id: Long,
+    groupId: Long,
+    userId: Long,
+    inviterId: Long,
+  )
 
 /**
-  * One user's pending request to join one group, flattened into a database row.
-  * At most one exists per user per group, maintained by [[GroupStore]]. A
-  * request is deleted once admitted, declined or withdrawn.
+  * A stored pending request to join a group, at most one per user per group,
+  * deleted once admitted, declined or withdrawn.
   *
   * @param groupId
-  *   The identifier of the group the user asks to join.
+  *   The identifier of the group.
   *
   * @param userId
   *   The identifier of the user asking.
@@ -412,33 +501,33 @@ final case class InvitationRow(id: Long, groupId: Long, userId: Long)
 final case class RequestRow(groupId: Long, userId: Long)
 
 /**
-  * One invite link, flattened into a database row.
+  * A stored invite link, leading to either a group or a resource: one kind's
+  * columns are filled and the other's empty.
   *
   * @param code
-  *   The code the link is known by, in lower case (see [[InviteCode]]). Kept as
-  *   it is rather than hashed, unlike a session's token, so that the owners of
-  *   what it leads to can copy the link again. They may replace it at any time.
+  *   The code in lower case (see [[InviteCode]]), stored unhashed so that its
+  *   owners can copy the link again.
   *
-  * @param creator
+  * @param creatorId
   *   The identifier of the user who made the link.
   *
   * @param groupId
-  *   The identifier of the group the link leads to, if it leads to one.
+  *   The identifier of the group the link leads to, if any.
   *
   * @param resourceKind
-  *   The kind of the resource the link leads to, if it leads to one.
+  *   The kind of the resource the link leads to, if any.
   *
   * @param resourceId
-  *   The identifier of that resource among those of its kind.
+  *   The identifier of the resource among those of its kind, if any.
   *
   * @param access
-  *   The stored name of the level of access over that resource that following
-  *   the link grants (see [[Access.name]]).
+  *   The stored code of the access following the link grants (see
+  *   [[Access.code]]), if it leads to a resource.
   */
-final case class LinkRow
+final case class InviteLinkRow
   (
     code: String,
-    creator: Long,
+    creatorId: Long,
     groupId: Option[Long],
     resourceKind: Option[String],
     resourceId: Option[Long],
@@ -446,8 +535,8 @@ final case class LinkRow
   ):
 
   /**
-    * Where this link leads, or `None` if the row names nothing this version can
-    * read, in which case the link leads nowhere, failing closed.
+    * The place this link leads, or `None` if the row names nothing this version
+    * can read, so that the link fails closed.
     */
   def target: Option[LinkTarget] = groupId
     .map(LinkTarget.Joining(_))
@@ -455,61 +544,151 @@ final case class LinkRow
       for
         kind  <- resourceKind
         id    <- resourceId
-        level <- access.flatMap(Access.fromName)
+        level <- access.flatMap(Access.fromCode)
       yield LinkTarget.Sharing(Resource(kind, id), level),
     )
 
-object LinkRow:
+object InviteLinkRow:
 
-  /** The row storing a link with the given code, made by the given user. */
+  /**
+    * Flattens a link into the row it is stored as.
+    *
+    * @param code
+    *   The link's code, in lower case.
+    *
+    * @param creatorId
+    *   The identifier of the user who made the link.
+    *
+    * @param target
+    *   The place the link leads.
+    *
+    * @return
+    *   A row storing the link.
+    */
   def of
     (
       code: String,
-      creator: Long,
+      creatorId: Long,
       target: LinkTarget,
     )
-    : LinkRow = target match
-    case LinkTarget.Joining(group) => LinkRow(
+    : InviteLinkRow = target match
+    case LinkTarget.Joining(groupId) => InviteLinkRow(
         code,
-        creator,
-        Some(group),
+        creatorId,
+        Some(groupId),
         None,
         None,
         None,
       )
-    case LinkTarget.Sharing(resource, access) => LinkRow(
+    case LinkTarget.Sharing(resource, access) => InviteLinkRow(
         code,
-        creator,
+        creatorId,
         None,
         Some(resource.kind),
         Some(resource.id),
-        Some(access.name),
+        Some(access.code),
       )
 
 /**
-  * One unused recovery code of one user, flattened into a database row. A code
-  * is deleted once used, and every code of a user when they generate a new set.
+  * A stored unused recovery code, deleted once used, or when its user generates
+  * a new set.
   *
   * @param id
-  *   The unique identifier of this row, assigned by the database.
+  *   The identifier, assigned by the database.
   *
   * @param userId
   *   The identifier of the user the code regains.
   *
   * @param codeHash
-  *   The hash of the code, as [[RecoveryCode.hash]] produces it.
+  *   The code's hash, as [[RecoveryCode.hash]] makes it.
   */
 final case class RecoveryCodeRow(id: Long, userId: Long, codeHash: String)
 
 /**
-  * One grant, flattened into a database row.
+  * A stored link sent by email, deleted once used, and with its user's other
+  * links whenever their password or address changes.
+  *
+  * @param tokenHash
+  *   The hash of the link's secret, as [[Digest]] makes it.
+  *
+  * @param userId
+  *   The identifier of the user the link was sent to.
+  *
+  * @param purpose
+  *   The stored code of what the link does (see [[EmailPurpose.code]]).
+  *
+  * @param address
+  *   The address the link was sent to; for a confirmation, the address it
+  *   confirms.
+  *
+  * @param sentAt
+  *   The time the link was sent, in milliseconds since the epoch.
+  *
+  * @param expiresAt
+  *   The time the link stops working, in milliseconds since the epoch.
+  */
+final case class EmailLinkRow
+  (
+    tokenHash: String,
+    userId: Long,
+    purpose: String,
+    address: String,
+    sentAt: Long,
+    expiresAt: Long,
+  )
+
+/**
+  * A stored record of a mail sent, or tried, with a link.
   *
   * @param id
-  *   The unique identifier of this row, assigned by the database. It identifies
-  *   the row only; a grant is identified by its resource and principal.
+  *   The identifier, assigned by the database.
+  *
+  * @param userId
+  *   The identifier of the user the link was for.
+  *
+  * @param purpose
+  *   The stored code of what the link did (see [[EmailPurpose.code]]).
+  *
+  * @param address
+  *   The address the mail was sent to.
+  *
+  * @param sentAt
+  *   The time it was sent, in milliseconds since the epoch.
+  */
+final case class SentMailRow
+  (
+    id: Long,
+    userId: Long,
+    purpose: String,
+    address: String,
+    sentAt: Long,
+  )
+
+/**
+  * A kind of link sent by email.
+  *
+  * @param code
+  *   The code it is stored under, spelled out so that renaming a case never
+  *   changes what a stored row means.
+  */
+enum EmailPurpose(val code: String):
+
+  /** A link resetting a forgotten password, sent to the confirmed address. */
+  case Reset extends EmailPurpose("reset")
+
+  /** A link confirming a new address, sent to that address. */
+  case Confirm extends EmailPurpose("confirm")
+
+/**
+  * A stored grant. At most one exists per principal per resource, maintained by
+  * [[GrantStore]].
+  *
+  * @param id
+  *   The row's identifier, assigned by the database; a grant is identified by
+  *   its resource and principal.
   *
   * @param resourceKind
-  *   The kind of the resource, as named by the host application.
+  *   The kind of the resource, as the host names it.
   *
   * @param resourceId
   *   The identifier of the resource among those of its kind.
@@ -521,7 +700,7 @@ final case class RecoveryCodeRow(id: Long, userId: Long, codeHash: String)
   *   The identifier of the user or group.
   *
   * @param access
-  *   The stored name of the level of access (see [[Access.name]]).
+  *   The stored code of the level of access (see [[Access.code]]).
   */
 final case class GrantRow
   (
@@ -534,14 +713,13 @@ final case class GrantRow
   ):
 
   /**
-    * Restores the grant stored in this row, or `None` if it names a kind of
-    * principal or a level of access this version does not know. Such a row then
-    * confers nothing, failing closed rather than guessing.
+    * The grant this row stores, or `None` if it names a principal kind or level
+    * this version does not know, so that the row confers nothing.
     */
   def toGrant: Option[Grant] =
     for
       principal <- Principal.of(principalKind, principalId)
-      level     <- Access.fromName(access)
+      level     <- Access.fromCode(access)
     yield Grant(
       Resource(resourceKind, resourceId),
       principal,
@@ -550,12 +728,20 @@ final case class GrantRow
 
 object GrantRow:
 
-  /** Flattens a grant into the row it is stored as, awaiting an identifier. */
+  /**
+    * Flattens a grant into the row it is stored as.
+    *
+    * @param grant
+    *   The grant to flatten.
+    *
+    * @return
+    *   A row awaiting its identifier.
+    */
   def of(grant: Grant): GrantRow = GrantRow(
     0,
     grant.resource.kind,
     grant.resource.id,
     grant.principal.kind,
     grant.principal.id,
-    grant.access.name,
+    grant.access.code,
   )

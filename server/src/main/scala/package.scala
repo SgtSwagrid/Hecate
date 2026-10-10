@@ -1,30 +1,41 @@
 package com.alecdorrington.hecate
 
+import cats.effect.IO
 import com.alecdorrington.hecate.model.AuthRefusal
 import scala.concurrent.ExecutionContext
 import slick.dbio.DBIO
 
-/** What every store here shares. */
+/** The definitions every store and service here shares. */
 package object server:
 
   /**
-    * Slick's `DBIO.map` and `DBIO.flatMap` need an `ExecutionContext` to run
-    * their continuations on. The work is trivial, so it runs on the thread that
-    * completes the action rather than hopping to a pool.
+    * A service's answer to a request: the result, or the refusal for the host
+    * to word. Never failed: an unexpected failure is reported to the host and
+    * answered as [[AuthRefusal.Failed]].
+    *
+    * @tparam X
+    *   The type of the result.
     */
+  type Answer[X] = IO[Either[AuthRefusal, X]]
+
+  /** Runs Slick's `DBIO` continuations on the thread completing the action. */
   given ExecutionContext = ExecutionContext.parasitic
 
   /**
-    * The given action over the given values, or the given answer where there
-    * are none, in which case the database is not asked at all: a query over an
-    * empty set has an answer already known here, and not every database will
-    * even accept one.
+    * Runs an action over some values, or answers without asking the database
+    * when there are none, as not every database accepts an empty `IN`.
+    *
+    * @tparam X
+    *   The type of the values.
+    *
+    * @tparam Y
+    *   The type of the answer.
     *
     * @param values
-    *   What the action is to be run over.
+    *   The values to run the action over.
     *
     * @param none
-    *   The answer where there are no values.
+    *   The answer when there are no values.
     *
     * @param some
     *   The action to run over the values, which are never empty.
@@ -38,25 +49,26 @@ package object server:
     (some: Seq[X] => DBIO[Y])
     : DBIO[Y] = if values.isEmpty then DBIO.successful(none) else some(values)
 
-  /** The found value, or a failed transaction refusing for the given reason. */
   private[server] def required[X]
-    (found: Option[X], problem: AuthRefusal)
+    (found: Option[X], refusal: AuthRefusal)
     : DBIO[X] =
-    found.fold[DBIO[X]](DBIO.failed(AuthProblem(problem)))(DBIO.successful)
+    found.fold[DBIO[X]](DBIO.failed(AuthProblem(refusal)))(DBIO.successful)
 
-  /**
-    * An action doing nothing if the check holds, or else a failed transaction
-    * refusing for the given reason.
-    */
   private[server] def refuseUnless
-    (holds: Boolean, problem: AuthRefusal)
+    (holds: Boolean, refusal: AuthRefusal)
     : DBIO[Unit] =
-    if holds then DBIO.successful(()) else DBIO.failed(AuthProblem(problem))
+    if holds then DBIO.unit else DBIO.failed(AuthProblem(refusal))
+
+  /** Answers with the first refusal among the checks, or else runs the answer. */
+  private[server] def checked[X]
+    (problems: Option[AuthRefusal]*)
+    (answer: => Answer[X])
+    : Answer[X] = problems
+    .flatten
+    .headOption
+    .fold(answer)(refusal => IO.pure(Left(refusal)))
 
   extension [X](action: DBIO[X])
 
-    /**
-      * This action, with whatever it produced discarded: the row counts that
-      * every write answers with, which nothing here ever reads.
-      */
+    /** This action with its result discarded. */
     def unit: DBIO[Unit] = action.map(_ => ())

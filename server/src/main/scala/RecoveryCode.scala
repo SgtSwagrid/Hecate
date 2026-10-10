@@ -3,24 +3,18 @@ package server
 
 import cats.effect.IO
 import java.security.SecureRandom
+import java.util.Locale
 
 /**
-  * One-time recovery codes, which regain an account whose password has been
-  * forgotten, without email or an administrator.
-  *
-  * A code is ten characters from an alphabet without look-alikes (no `0`/`o`,
-  * `1`/`i`/`l`), shown as two groups of five; about 49 bits of entropy each, so
-  * that guessing one is hopeless without any rate limit. Codes are stored only
-  * as SHA-256 hashes. Unlike passwords, they need no slow, salted hash: they
-  * are random rather than chosen by a person, so no dictionary of likely codes
-  * exists to try against a stolen hash.
+  * A generator of one-time recovery codes, which regain an account without
+  * email or an administrator. A code is ten characters with no look-alikes,
+  * shown as two groups of five, about 49 bits of entropy; being random, it is
+  * stored as a plain SHA-256 hash.
   */
 object RecoveryCode:
 
-  /** The characters a code is made from: lower case, with no look-alikes. */
   private val alphabet = "abcdefghjkmnpqrstuvwxyz23456789"
 
-  /** The number of characters in a code, not counting its separator. */
   private val length = 10
 
   /** The number of codes in a fresh set. */
@@ -28,21 +22,26 @@ object RecoveryCode:
 
   private val random = SecureRandom()
 
-  /** Generates a fresh set of codes, in the form they are to be written down. */
+  /** An effect generating a fresh set of codes, as they are to be written down. */
   val generate: IO[List[String]] = IO(List.fill(setSize)(fresh))
 
   /**
-    * The hash a code is stored as. Spacing, hyphens and letter case are
-    * ignored, so that a code is accepted however it was copied out.
+    * Hashes a code for storage, ignoring spacing, hyphens and letter case.
+    *
+    * @param code
+    *   The code as typed.
+    *
+    * @return
+    *   A hash in the form the code is stored as.
     */
   def hash(code: String): String = Digest.of(normalise(code))
 
-  /** One fresh code, as two hyphenated groups of five. */
   private def fresh: String =
-    val chars = List.fill(length)(alphabet(random.nextInt(alphabet.length)))
-    s"${ chars.take(length / 2).mkString }-${ chars.drop(length / 2).mkString }"
+    val characters =
+      List.fill(length)(alphabet(random.nextInt(alphabet.length)))
+    s"${ characters.take(length / 2).mkString }-" +
+      characters.drop(length / 2).mkString
 
-  /** A code reduced to its characters alone, in lower case. */
   private def normalise(code: String): String = code
-    .toLowerCase
+    .toLowerCase(Locale.ROOT)
     .filter(_.isLetterOrDigit)
