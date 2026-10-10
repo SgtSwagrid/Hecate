@@ -3,19 +3,16 @@ package server
 
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
+import java.util.HexFormat
 
 /**
-  * The hash a secret that this library did not choose for a person is stored
-  * as: SHA-256, as lower-case hexadecimal text.
-  *
-  * Session tokens and recovery codes are hashed with this, and passwords are
-  * not. A password is chosen by a person, so a stolen hash of one can be
-  * attacked with a dictionary, and it needs the slow, salted derivation in
-  * [[Passwords]]. These are drawn at random from enough entropy that no such
-  * dictionary can exist, so a plain digest is enough, and cheap enough to
-  * afford on every request that carries one.
+  * The SHA-256 hash, as lower-case hexadecimal, that random secrets such as
+  * session tokens and recovery codes are stored as. Unfit for passwords, which
+  * need the salted derivation in [[Passwords]].
   */
 private[server] object Digest:
+
+  private val hex = HexFormat.of()
 
   /**
     * The hash the given text is stored as.
@@ -26,8 +23,8 @@ private[server] object Digest:
     * @return
     *   The SHA-256 of the text, as lower-case hexadecimal.
     */
-  def of(secret: String): String = MessageDigest
-    .getInstance("SHA-256")
-    .digest(secret.getBytes(StandardCharsets.UTF_8))
-    .map(byte => f"$byte%02x")
-    .mkString
+  def of(secret: String): String = hex.formatHex(
+    MessageDigest
+      .getInstance("SHA-256")
+      .digest(secret.getBytes(StandardCharsets.UTF_8)),
+  )

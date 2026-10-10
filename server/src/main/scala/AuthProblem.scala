@@ -5,16 +5,14 @@ import com.alecdorrington.hecate.i18n.Wording
 import com.alecdorrington.hecate.model.AuthRefusal
 
 /**
-  * A failure that is the user's to understand, such as a request naming a group
-  * that does not exist. The services report these worded for the user in their
-  * own language, whereas any other failure is reported generically, so that no
-  * driver or SQL detail escapes to the client.
-  *
-  * Its message is the refusal in English, for logs and for tests that match on
-  * one; a client is shown it worded in its own language instead.
+  * A failure the user should be told about, such as a request naming a missing
+  * group. The services answer it with its refusal, worded in the user's
+  * language; any other failure is answered as [[AuthRefusal.Failed]], so no
+  * driver or SQL detail reaches the client. Its message is the refusal in
+  * English.
   *
   * @param refusal
-  *   Why the request was refused.
+  *   The reason the request was refused.
   */
 final case class AuthProblem(refusal: AuthRefusal)
   extends Exception(Wording.english.phrase(refusal))

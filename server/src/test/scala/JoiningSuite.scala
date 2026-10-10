@@ -1,22 +1,17 @@
 package com.alecdorrington.hecate
 package server
 
-import Fixtures.{enrol, newUser, refusal}
+import Fixtures.{enrol, refusal, register}
 import cats.effect.IO
 import com.alecdorrington.hecate.i18n.Wording
 import com.alecdorrington.hecate.model.{
-  GroupDraft, Invitation, InviteCode, LinkTarget, User,
+  GroupDetails, Invitation, InviteCode, LinkTarget, Principal, User,
 }
+import java.util.Locale
 import munit.CatsEffectSuite
 
-/**
-  * Tests of the ways into a group besides an invitation: an owner joining their
-  * own group, a request to join and its answer, a public group, and a group's
-  * invite link.
-  */
 class JoiningSuite extends CatsEffectSuite:
 
-  /** Runs a check against stores backed by a fresh in-memory database. */
   private def withStores
     (name: String)
     (check: (GroupStore, UserStore, TestDb) => IO[Unit])
@@ -30,7 +25,6 @@ class JoiningSuite extends CatsEffectSuite:
       ),
     )
 
-  /** The identifiers of the direct members of one of the owner's groups. */
   private def membersOf
     (
       groups: GroupStore,
@@ -38,7 +32,7 @@ class JoiningSuite extends CatsEffectSuite:
       group: Long,
     )
     : IO[List[Long]] = groups
-    .owned(owner.id)
+    .managed(owner.id)
     .map(_.find(_.group.id == group).toList.flatMap(_.members.map(_.id)))
 
   private val english = Wording.english
@@ -46,9 +40,9 @@ class JoiningSuite extends CatsEffectSuite:
   test("an owner joins their own group directly, and only their own"):
     withStores("join"): (groups, users, _) =>
       for
-        owner    <- newUser(users, "owner")
-        stranger <- newUser(users, "stranger")
-        team     <- groups.create(owner.id, GroupDraft("Team"))
+        owner    <- register(users, "owner")
+        stranger <- register(users, "stranger")
+        team     <- groups.create(owner.id, GroupDetails("Team"))
         _        <- groups.join(owner.id, team.id)
         _        <- groups.join(owner.id, team.id)
         refused  <- refusal(groups.join(stranger.id, team.id))
@@ -60,8 +54,8 @@ class JoiningSuite extends CatsEffectSuite:
   test("an owner inviting themselves joins rather than being invited"):
     withStores("self-invite"): (groups, users, _) =>
       for
-        owner   <- newUser(users, "owner")
-        team    <- groups.create(owner.id, GroupDraft("Team"))
+        owner   <- register(users, "owner")
+        team    <- groups.create(owner.id, GroupDetails("Team"))
         _       <- groups.invite(owner.id, team.id, owner.username)
         pending <- groups.invitations(owner.id)
         members <- membersOf(groups, owner, team.id)
@@ -72,17 +66,17 @@ class JoiningSuite extends CatsEffectSuite:
   test("a member of a group may ask to join a group nested inside it"):
     withStores("nested-request"): (groups, users, _) =>
       for
-        owner  <- newUser(users, "owner")
-        member <- newUser(users, "member")
-        dept   <- groups.create(owner.id, GroupDraft("Department"))
+        owner  <- register(users, "owner")
+        member <- register(users, "member")
+        dept   <- groups.create(owner.id, GroupDetails("Department"))
         team   <- groups.create(
           owner.id,
-          GroupDraft("Team", Some(dept.id)),
+          GroupDetails("Team", Some(dept.id)),
         )
         _     <- enrol(groups, owner, dept.id, member)
         _     <- groups.request(member.id, team.id)
         _     <- groups.request(member.id, team.id)
-        views <- groups.owned(owner.id)
+        views <- groups.managed(owner.id)
         found <- groups.joinable(member.id)
       yield
         assertEquals(
@@ -94,20 +88,20 @@ class JoiningSuite extends CatsEffectSuite:
           List(team.id -> true),
         )
         assertEquals(
-          found.map(_.manager.id),
-          List(owner.id),
+          found.map(_.owners.map(_.principal)),
+          List(List(Principal.Person(owner.id))),
         )
 
   test("admitting someone who asked makes them a member"):
     withStores("admit"): (groups, users, _) =>
       for
-        owner  <- newUser(users, "owner")
-        member <- newUser(users, "member")
-        team   <- groups.create(owner.id, GroupDraft("Team"))
-        _      <- groups.publish(owner.id, team.id, true)
+        owner  <- register(users, "owner")
+        member <- register(users, "member")
+        team   <- groups.create(owner.id, GroupDetails("Team"))
+        _      <- groups.setPublic(owner.id, team.id, true)
         _      <- groups.request(member.id, team.id)
         _      <- groups.admit(owner.id, team.id, member.id)
-        views  <- groups.owned(owner.id)
+        views  <- groups.managed(owner.id)
         found  <- groups.joinable(member.id)
       yield
         val view = views.find(_.group.id == team.id).get
@@ -121,9 +115,9 @@ class JoiningSuite extends CatsEffectSuite:
   test("nobody can be admitted who has not asked"):
     withStores("admit-unasked"): (groups, users, _) =>
       for
-        owner    <- newUser(users, "owner")
-        stranger <- newUser(users, "stranger")
-        team     <- groups.create(owner.id, GroupDraft("Team"))
+        owner    <- register(users, "owner")
+        stranger <- register(users, "stranger")
+        team     <- groups.create(owner.id, GroupDetails("Team"))
         refused  <- refusal(groups.admit(owner.id, team.id, stranger.id))
         members  <- membersOf(groups, owner, team.id)
       yield
@@ -135,15 +129,15 @@ class JoiningSuite extends CatsEffectSuite:
   ):
     withStores("public"): (groups, users, _) =>
       for
-        owner    <- newUser(users, "owner")
-        stranger <- newUser(users, "stranger")
-        team     <- groups.create(owner.id, GroupDraft("Team"))
+        owner    <- register(users, "owner")
+        stranger <- register(users, "stranger")
+        team     <- groups.create(owner.id, GroupDetails("Team"))
         before   <- groups.joinable(stranger.id)
         refused  <- refusal(groups.request(stranger.id, team.id))
-        _        <- groups.publish(owner.id, team.id, true)
+        _        <- groups.setPublic(owner.id, team.id, true)
         after    <- groups.joinable(stranger.id)
         _        <- groups.request(stranger.id, team.id)
-        views    <- groups.owned(owner.id)
+        views    <- groups.managed(owner.id)
       yield
         assertEquals(before, List.empty)
         assertEquals(refused, Some(english.groupMissing))
@@ -157,10 +151,10 @@ class JoiningSuite extends CatsEffectSuite:
   test("only the owner may make a group public"):
     withStores("publish-owner"): (groups, users, _) =>
       for
-        owner    <- newUser(users, "owner")
-        stranger <- newUser(users, "stranger")
-        team     <- groups.create(owner.id, GroupDraft("Team"))
-        refused  <- refusal(groups.publish(stranger.id, team.id, true))
+        owner    <- register(users, "owner")
+        stranger <- register(users, "stranger")
+        team     <- groups.create(owner.id, GroupDetails("Team"))
+        refused  <- refusal(groups.setPublic(stranger.id, team.id, true))
         found    <- groups.joinable(stranger.id)
       yield
         assertEquals(refused, Some(english.groupMissing))
@@ -169,28 +163,31 @@ class JoiningSuite extends CatsEffectSuite:
   test("a public group nested in a private one hides its parent"):
     withStores("hidden-parent"): (groups, users, _) =>
       for
-        owner    <- newUser(users, "owner")
-        stranger <- newUser(users, "stranger")
-        dept     <- groups.create(owner.id, GroupDraft("Department"))
+        owner    <- register(users, "owner")
+        stranger <- register(users, "stranger")
+        dept     <- groups.create(owner.id, GroupDetails("Department"))
         team     <- groups.create(
           owner.id,
-          GroupDraft("Team", Some(dept.id)),
+          GroupDetails("Team", Some(dept.id)),
         )
-        _     <- groups.publish(owner.id, team.id, true)
+        _     <- groups.setPublic(owner.id, team.id, true)
         found <- groups.joinable(stranger.id)
-      yield assertEquals(found.map(_.group.parent), List(None))
+      yield assertEquals(
+        found.map(_.group.parentId),
+        List(None),
+      )
 
   test("groups the user owns, belongs to or is invited to are not joinable"):
     withStores("not-joinable"): (groups, users, _) =>
       for
-        owner  <- newUser(users, "owner")
-        member <- newUser(users, "member")
-        mine   <- groups.create(member.id, GroupDraft("Mine"))
-        joined <- groups.create(owner.id, GroupDraft("Joined"))
-        asked  <- groups.create(owner.id, GroupDraft("Invited"))
-        _      <- groups.publish(member.id, mine.id, true)
-        _      <- groups.publish(owner.id, joined.id, true)
-        _      <- groups.publish(owner.id, asked.id, true)
+        owner  <- register(users, "owner")
+        member <- register(users, "member")
+        mine   <- groups.create(member.id, GroupDetails("Mine"))
+        joined <- groups.create(owner.id, GroupDetails("Joined"))
+        asked  <- groups.create(owner.id, GroupDetails("Invited"))
+        _      <- groups.setPublic(member.id, mine.id, true)
+        _      <- groups.setPublic(owner.id, joined.id, true)
+        _      <- groups.setPublic(owner.id, asked.id, true)
         _      <- enrol(groups, owner, joined.id, member)
         _      <- groups.invite(owner.id, asked.id, member.username)
         found  <- groups.joinable(member.id)
@@ -199,9 +196,9 @@ class JoiningSuite extends CatsEffectSuite:
   test("asking to join a group one is invited to accepts the invitation"):
     withStores("ask-invited"): (groups, users, _) =>
       for
-        owner   <- newUser(users, "owner")
-        member  <- newUser(users, "member")
-        team    <- groups.create(owner.id, GroupDraft("Team"))
+        owner   <- register(users, "owner")
+        member  <- register(users, "member")
+        team    <- groups.create(owner.id, GroupDetails("Team"))
         _       <- groups.invite(owner.id, team.id, member.username)
         _       <- groups.request(member.id, team.id)
         pending <- groups.invitations(member.id)
@@ -213,10 +210,10 @@ class JoiningSuite extends CatsEffectSuite:
   test("inviting someone who has asked to join admits them"):
     withStores("invite-asked"): (groups, users, _) =>
       for
-        owner   <- newUser(users, "owner")
-        member  <- newUser(users, "member")
-        team    <- groups.create(owner.id, GroupDraft("Team"))
-        _       <- groups.publish(owner.id, team.id, true)
+        owner   <- register(users, "owner")
+        member  <- register(users, "member")
+        team    <- groups.create(owner.id, GroupDetails("Team"))
+        _       <- groups.setPublic(owner.id, team.id, true)
         _       <- groups.request(member.id, team.id)
         _       <- groups.invite(owner.id, team.id, member.username)
         pending <- groups.invitations(member.id)
@@ -226,18 +223,18 @@ class JoiningSuite extends CatsEffectSuite:
         assertEquals(members, List(member.id))
 
   test("a request withdrawn or declined is gone, and may be made again"):
-    withStores("retract"): (groups, users, _) =>
+    withStores("withdraw"): (groups, users, _) =>
       for
-        owner    <- newUser(users, "owner")
-        member   <- newUser(users, "member")
-        team     <- groups.create(owner.id, GroupDraft("Team"))
-        _        <- groups.publish(owner.id, team.id, true)
+        owner    <- register(users, "owner")
+        member   <- register(users, "member")
+        team     <- groups.create(owner.id, GroupDetails("Team"))
+        _        <- groups.setPublic(owner.id, team.id, true)
         _        <- groups.request(member.id, team.id)
-        _        <- groups.retract(member.id, team.id)
-        withdrew <- groups.owned(owner.id)
+        _        <- groups.withdraw(member.id, team.id)
+        withdrew <- groups.managed(owner.id)
         _        <- groups.request(member.id, team.id)
-        _        <- groups.withdraw(owner.id, team.id, member.id)
-        declined <- groups.owned(owner.id)
+        _        <- groups.remove(owner.id, team.id, member.id)
+        declined <- groups.managed(owner.id)
         again    <- groups.joinable(member.id)
       yield
         assertEquals(
@@ -255,14 +252,14 @@ class JoiningSuite extends CatsEffectSuite:
   ):
     withStores("group-link"): (groups, users, _) =>
       for
-        owner   <- newUser(users, "owner")
-        team    <- groups.create(owner.id, GroupDraft("Team"))
+        owner   <- register(users, "owner")
+        team    <- groups.create(owner.id, GroupDetails("Team"))
         first   <- groups.link(owner.id, team.id)
         same    <- groups.link(owner.id, team.id)
-        shown   <- groups.owned(owner.id)
+        shown   <- groups.managed(owner.id)
         renewed <- groups.relink(owner.id, team.id)
         _       <- groups.unlink(owner.id, team.id)
-        gone    <- groups.owned(owner.id)
+        gone    <- groups.managed(owner.id)
       yield
         assertEquals(same, first)
         assertEquals(InviteCode.parse(first), Some(first))
@@ -276,9 +273,9 @@ class JoiningSuite extends CatsEffectSuite:
   test("only the owner may make a group's invite link"):
     withStores("group-link-owner"): (groups, users, _) =>
       for
-        owner    <- newUser(users, "owner")
-        stranger <- newUser(users, "stranger")
-        team     <- groups.create(owner.id, GroupDraft("Team"))
+        owner    <- register(users, "owner")
+        stranger <- register(users, "stranger")
+        team     <- groups.create(owner.id, GroupDetails("Team"))
         refused  <- refusal(groups.link(stranger.id, team.id))
       yield assertEquals(refused, Some(english.groupMissing))
 
@@ -286,10 +283,10 @@ class JoiningSuite extends CatsEffectSuite:
     withStores("delete-link"): (groups, users, db) =>
       val links = LinkStore(TestDb.tables)
       for
-        owner  <- newUser(users, "owner")
-        member <- newUser(users, "member")
-        team   <- groups.create(owner.id, GroupDraft("Team"))
-        _      <- groups.publish(owner.id, team.id, true)
+        owner  <- register(users, "owner")
+        member <- register(users, "member")
+        team   <- groups.create(owner.id, GroupDetails("Team"))
+        _      <- groups.setPublic(owner.id, team.id, true)
         _      <- groups.request(member.id, team.id)
         code   <- groups.link(owner.id, team.id)
         _      <- groups.delete(owner.id, team.id)
@@ -303,10 +300,10 @@ class JoiningSuite extends CatsEffectSuite:
     withStores("link-case"): (groups, users, db) =>
       val links = LinkStore(TestDb.tables)
       for
-        owner <- newUser(users, "owner")
-        team  <- groups.create(owner.id, GroupDraft("Team"))
+        owner <- register(users, "owner")
+        team  <- groups.create(owner.id, GroupDetails("Team"))
         code  <- groups.link(owner.id, team.id)
-        found <- db.run(links.find(code.toUpperCase))
+        found <- db.run(links.find(code.toUpperCase(Locale.ROOT)))
       yield
         assertEquals(
           found.flatMap(_._1.target),

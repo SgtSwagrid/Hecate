@@ -5,11 +5,21 @@ import cats.effect.IO
 import slick.dbio.DBIO
 
 /**
-  * A handle to the database the auth stores read and write, supplied by the
-  * host application so that this library neither opens nor owns a connection.
-  * Applications that already wrap Slick in [[IO]] can simply extend this.
+  * A handle to the host's database, through which the stores run their queries;
+  * this library opens no connection of its own.
   */
 trait Transactor:
 
-  /** Runs a database action, suspending its effects in [[IO]]. */
+  /**
+    * Runs a database action.
+    *
+    * @tparam X
+    *   The type of the action's result.
+    *
+    * @param action
+    *   The action to run.
+    *
+    * @return
+    *   An effect producing the action's result.
+    */
   def run[X](action: DBIO[X]): IO[X]

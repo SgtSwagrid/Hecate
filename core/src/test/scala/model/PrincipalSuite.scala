@@ -7,10 +7,11 @@ import munit.FunSuite
 
 class PrincipalSuite extends FunSuite:
 
-  test("a principal round-trips through JSON as either case"):
+  test("a principal round-trips through JSON as any case"):
     List(
       Principal.Person(1),
       Principal.Group(2),
+      Principal.System,
     ).foreach(principal =>
       assertEquals(
         principal.asJson.as[Principal],
@@ -22,6 +23,7 @@ class PrincipalSuite extends FunSuite:
     List[(Principal, String)](
       Principal.Person(7) -> "person",
       Principal.Group(7)  -> "group",
+      Principal.System    -> "system",
     ).foreach((principal, kind) =>
       assertEquals(
         principal.asJson.hcursor.downField("kind").as[String],
@@ -40,6 +42,7 @@ class PrincipalSuite extends FunSuite:
     List(
       Principal.Person(5),
       Principal.Group(5),
+      Principal.System,
     ).foreach(principal =>
       assertEquals(
         Principal.of(principal.kind, principal.id),
@@ -52,3 +55,7 @@ class PrincipalSuite extends FunSuite:
     val group: Principal  = Principal.Group(7)
     assertNotEquals(person, group)
     assertEquals(person.id, group.id)
+
+  test("the system is one principal, never another identifier"):
+    assertEquals(Principal.System.id, 0L)
+    assertEquals(Principal.of("system", 1), None)

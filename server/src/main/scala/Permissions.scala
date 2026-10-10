@@ -2,24 +2,25 @@ package com.alecdorrington.hecate
 package server
 
 import cats.effect.IO
-import com.alecdorrington.hecate.model.{Access, Principal, Resource}
+import com.alecdorrington.hecate.model.{Access, Resource}
+import slick.dbio.DBIO
 
 /**
-  * Resolves what a user may do, by joining the grants over a resource with the
-  * groups the user effectively belongs to. Only stored grants are considered:
-  * any access a host application derives from its own data (such as authorship)
-  * is layered on top by the host, which alone knows what its resources are.
+  * A resolver of the stored access users hold, joining the grants over a
+  * resource with the principals each user acts as: themselves, the groups they
+  * belong to, and the system if the host names them as acting for it. Access
+  * the host derives from its own data is not considered here.
   *
   * @param groups
-  *   The store whose group memberships determine which grants reach a user.
+  *   The store of groups, which decides the principals each user acts as.
   *
   * @param grants
-  *   The store of the grants themselves.
+  *   The store of grants.
   */
 final class Permissions(groups: GroupStore, grants: GrantStore):
 
   /**
-    * The highest stored access that reaches one user over one resource.
+    * Resolves the highest stored access a user holds over a resource.
     *
     * @param user
     *   The identifier of the user.
@@ -28,56 +29,55 @@ final class Permissions(groups: GroupStore, grants: GrantStore):
     *   The resource to resolve access over.
     *
     * @return
-    *   A highest level of access reaching the user, or `None` if no grant does.
+    *   An effect producing the highest level reaching the user, or `None` if no
+    *   grant does.
     */
   def access(user: Long, resource: Resource): IO[Option[Access]] = groups
-    .groupIdsOf(user)
-    .flatMap(grants.access(user, _, resource))
+    .principalsOf(user)
+    .flatMap(grants.access(_, resource))
 
   /**
-    * The identifiers of every resource of one kind over which one user holds at
-    * least the given stored access.
+    * Lists the resources of one kind over which a user holds at least the given
+    * stored access.
     *
     * @param user
     *   The identifier of the user.
     *
     * @param kind
-    *   The kind of resource to list, as named by the host application.
+    *   The kind of resource, as the host names it.
     *
     * @param least
     *   The lowest level of access that counts.
     *
     * @return
-    *   A set of the identifiers of every such resource, possibly empty.
+    *   An effect producing the identifiers of the resources.
     */
-  def visible(user: Long, kind: String, least: Access): IO[Set[Long]] = groups
-    .groupIdsOf(user)
-    .flatMap(grants.visible(user, _, kind, least))
+  def accessible(user: Long, kind: String, least: Access): IO[Set[Long]] =
+    groups.principalsOf(user).flatMap(grants.accessible(_, kind, least))
 
   /**
-    * The highest stored access one user holds over every resource of one kind
-    * that any grant reaching them names, resolved together rather than one
-    * resource at a time.
+    * Resolves, in one query, the highest stored access a user holds over every
+    * resource of one kind that a grant reaching them names.
     *
     * @param user
     *   The identifier of the user.
     *
     * @param kind
-    *   The kind of resource to resolve, as named by the host application.
+    *   The kind of resource, as the host names it.
     *
     * @return
-    *   A map from the identifier of each such resource to the highest level of
-    *   access the user holds over it.
+    *   An effect producing each resource's identifier mapped to the highest
+    *   level the user holds over it.
     */
   def levels(user: Long, kind: String): IO[Map[Long, Access]] = groups
-    .groupIdsOf(user)
-    .flatMap(grants.levels(user, _, kind))
+    .principalsOf(user)
+    .flatMap(grants.levels(_, kind))
 
   /**
-    * Everyone that stored access of at least the given level over one resource
-    * reaches: whoever it is granted to personally, and every member of any
-    * group it is granted to, or of a group nested inside one. The reverse of
-    * [[access]], for telling whoever holds a resource that it has changed.
+    * Finds every user whom stored access of at least the given level over a
+    * resource reaches: its personal grantees, the members of any group it is
+    * granted to or of a group nested inside one, and, if it is granted to the
+    * system, everyone acting for it. The reverse of [[access]].
     *
     * @param resource
     *   The resource whose holders to find.
@@ -86,18 +86,22 @@ final class Permissions(groups: GroupStore, grants: GrantStore):
     *   The lowest level of access that counts.
     *
     * @return
-    *   A set of the identifiers of every such user, possibly empty.
+    *   An effect producing the identifiers of the users.
     */
   def holders
     (
       resource: Resource,
       least: Access = Access.View,
     )
-    : IO[Set[Long]] = grants
-    .grantsOver(resource)
-    .map(_.filter(_.access.includes(least)).map(_.principal))
-    .flatMap(principals =>
-      groups
-        .membersWithin(principals.collect { case Principal.Group(id) => id })
-        .map(_.toSet ++ principals.collect { case Principal.Person(id) => id }),
+    : IO[Set[Long]] = grants.run(holding(resource, least))
+
+  /** As [[holders]], in the caller's transaction. */
+  private[server] def holding
+    (
+      resource: Resource,
+      least: Access = Access.View,
     )
+    : DBIO[Set[Long]] = grants
+    .granted(resource)
+    .map(_.filter(_.access.includes(least)).map(_.principal))
+    .flatMap(groups.usersOf)

@@ -3,7 +3,7 @@ ThisBuild / description :=
 
 ThisBuild / homepage := Some(uri("https://github.com/SgtSwagrid/Hecate"))
 
-// Stated rather than read from the git remote, which is the host's when built there:
+// Stated, as the git remote is the host's when built there.
 ThisBuild / scmInfo := Some(ScmInfo(
   uri("https://github.com/SgtSwagrid/Hecate"),
   "scm:git:https://github.com/SgtSwagrid/Hecate.git",

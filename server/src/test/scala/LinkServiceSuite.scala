@@ -1,22 +1,15 @@
 package com.alecdorrington.hecate
 package server
 
-import Fixtures.{give, read, serve, SendRequest}
+import Fixtures.{cheap, grant}
 import cats.effect.IO
-import com.alecdorrington.hecate.api.AuthApi
-import com.alecdorrington.hecate.i18n.Wording
 import com.alecdorrington.hecate.model.{
-  Access, GroupDraft, LinkPreview, LinkTarget, Principal, Resource, User,
+  Access, AuthRefusal, GroupDetails, LinkTarget, Principal, Resource, User,
 }
+import java.util.Locale
 import munit.CatsEffectSuite
 import slick.dbio.DBIO
-import sttp.client3.{basicRequest, UriContext}
 
-/**
-  * Tests of the endpoints [[LinkService]] serves: what an invite link shows
-  * whoever opens it, and what following it gives them, for a link to a group
-  * and a link to a resource.
-  */
 class LinkServiceSuite extends CatsEffectSuite:
 
   import LinkServiceSuite.*
@@ -24,18 +17,18 @@ class LinkServiceSuite extends CatsEffectSuite:
   test("following a group's link joins it, once the preview has named it"):
     served(): world =>
       for
-        (owner, _)       <- world.signUp("owner")
-        (reader, cookie) <- world.signUp("reader")
-        team     <- world.groups.create(owner.id, GroupDraft("Book club"))
+        owner    <- world.signUp("owner")
+        reader   <- world.signUp("reader")
+        team     <- world.groups.create(owner.id, GroupDetails("Book club"))
         code     <- world.groups.link(owner.id, team.id)
-        before   <- world.preview(cookie, code.toUpperCase)
-        followed <- world.follow(cookie, code)
-        after    <- world.preview(cookie, code)
-        members  <- world.groups.owned(owner.id)
+        before   <- world.service.preview(reader, code.toUpperCase(Locale.ROOT))
+        followed <- world.service.follow(reader, code)
+        after    <- world.service.preview(reader, code)
+        members  <- world.groups.managed(owner.id)
       yield
         assertEquals(
           before.map(preview =>
-            (preview.name, preview.sender.id, preview.already),
+            (preview.name, preview.inviter.id, preview.already),
           ),
           Right(("Book club", owner.id, false)),
         )
@@ -52,21 +45,18 @@ class LinkServiceSuite extends CatsEffectSuite:
   test("a replaced or turned-off link leads nowhere"):
     served(): world =>
       for
-        (owner, _)  <- world.signUp("owner")
-        (_, cookie) <- world.signUp("reader")
-        team        <- world.groups.create(owner.id, GroupDraft("Book club"))
-        old         <- world.groups.link(owner.id, team.id)
-        fresh       <- world.groups.relink(owner.id, team.id)
-        stale       <- world.follow(cookie, old)
-        _           <- world.groups.unlink(owner.id, team.id)
-        off         <- world.follow(cookie, fresh)
-        members     <- world.groups.owned(owner.id)
+        owner   <- world.signUp("owner")
+        reader  <- world.signUp("reader")
+        team    <- world.groups.create(owner.id, GroupDetails("Book club"))
+        old     <- world.groups.link(owner.id, team.id)
+        fresh   <- world.groups.relink(owner.id, team.id)
+        stale   <- world.service.follow(reader, old)
+        _       <- world.groups.unlink(owner.id, team.id)
+        off     <- world.service.follow(reader, fresh)
+        members <- world.groups.managed(owner.id)
       yield
-        assertEquals(
-          stale,
-          Left(Wording.english.linkMissing),
-        )
-        assertEquals(off, Left(Wording.english.linkMissing))
+        assertEquals(stale, Left(AuthRefusal.LinkMissing))
+        assertEquals(off, Left(AuthRefusal.LinkMissing))
         assertEquals(
           members.flatMap(_.members),
           List.empty[User],
@@ -75,34 +65,39 @@ class LinkServiceSuite extends CatsEffectSuite:
   test("text that could not be a code leads nowhere"):
     served(): world =>
       for
-        (_, cookie) <- world.signUp("reader")
-        wrong       <- world.preview(cookie, "ab-12")
-        short       <- world.preview(cookie, "abc")
+        reader <- world.signUp("reader")
+        wrong  <- world.service.preview(reader, "ab-12")
+        short  <- world.service.preview(reader, "abc")
+        long   <- world.service.preview(reader, "abcd1" * 1000)
       yield
         assertEquals(
           wrong.map(_.name),
-          Left(Wording.english.linkMissing),
+          Left(AuthRefusal.LinkMissing),
         )
-        assert(
-          short.isLeft,
-          "a code of three characters was looked up",
+        assertEquals(
+          short.map(_.name),
+          Left(AuthRefusal.LinkMissing),
+        )
+        assertEquals(
+          long.map(_.name),
+          Left(AuthRefusal.LinkMissing),
         )
 
   test("following a resource's link grants its access, and never lowers any"):
     served(): world =>
       for
-        (owner, _)       <- world.signUp("owner")
-        (reader, cookie) <- world.signUp("reader")
-        (editor, theirs) <- world.signUp("editor")
-        _                <- give(world.grants, world.db)(
+        owner  <- world.signUp("owner")
+        reader <- world.signUp("reader")
+        editor <- world.signUp("editor")
+        _      <- grant(world.grants, world.db)(
           book,
           Principal.Person(editor.id),
           Access.Edit,
         )
         code    <- world.share(owner, Access.View)
-        preview <- world.preview(cookie, code)
-        _       <- world.follow(cookie, code)
-        _       <- world.follow(theirs, code)
+        preview <- world.service.preview(reader, code)
+        _       <- world.service.follow(reader, code)
+        _       <- world.service.follow(editor, code)
         readers <- world.accessOf(reader)
         editors <- world.accessOf(editor)
       yield
@@ -116,33 +111,33 @@ class LinkServiceSuite extends CatsEffectSuite:
   test("a link to a resource that is gone leads nowhere, and grants nothing"):
     served(): world =>
       for
-        (owner, _)       <- world.signUp("owner")
-        (reader, cookie) <- world.signUp("reader")
-        code             <- world.share(
+        owner  <- world.signUp("owner")
+        reader <- world.signUp("reader")
+        code   <- world.share(
           owner,
           Access.View,
           Resource("book", 404),
         )
-        followed <- world.follow(cookie, code)
+        followed <- world.service.follow(reader, code)
         held     <- world.accessOf(reader, Resource("book", 404))
       yield
         assertEquals(
           followed,
-          Left(Wording.english.linkMissing),
+          Left(AuthRefusal.LinkMissing),
         )
         assertEquals(held, None)
 
   test("withdrawing every grant over a resource turns its link off"):
     served(): world =>
       for
-        (owner, _)  <- world.signUp("owner")
-        (_, cookie) <- world.signUp("reader")
-        code        <- world.share(owner, Access.View)
-        _           <- world.db.run(world.grants.revokeAll(book))
-        followed    <- world.follow(cookie, code)
+        owner    <- world.signUp("owner")
+        reader   <- world.signUp("reader")
+        code     <- world.share(owner, Access.View)
+        _        <- world.db.run(world.grants.revokeOver(book))
+        followed <- world.service.follow(reader, code)
       yield assertEquals(
         followed,
-        Left(Wording.english.linkMissing),
+        Left(AuthRefusal.LinkMissing),
       )
 
   test(
@@ -150,64 +145,163 @@ class LinkServiceSuite extends CatsEffectSuite:
   ):
     served(guesses = 2): world =>
       for
-        (owner, _)  <- world.signUp("owner")
-        (_, cookie) <- world.signUp("guesser")
-        (_, other)  <- world.signUp("reader")
-        team        <- world.groups.create(owner.id, GroupDraft("Book club"))
-        code        <- world.groups.link(owner.id, team.id)
-        wrong = if code == "aaaa1" then "bbbb1" else "aaaa1"
-        _          <- world.preview(cookie, wrong)
-        _          <- world.preview(cookie, wrong)
-        blocked    <- world.preview(cookie, code)
-        unaffected <- world.preview(other, code)
+        owner   <- world.signUp("owner")
+        guesser <- world.signUp("guesser")
+        other   <- world.signUp("reader")
+        team    <- world.groups.create(owner.id, GroupDetails("Book club"))
+        code    <- world.groups.link(owner.id, team.id)
+        wrong = otherThan(code)
+        _          <- world.service.preview(guesser, wrong)
+        _          <- world.service.preview(guesser, wrong)
+        blocked    <- world.service.preview(guesser, code)
+        unaffected <- world.service.preview(other, code)
       yield
         assertEquals(
           blocked.map(_.name),
-          Left(Wording.english.linkMissing),
+          Left(AuthRefusal.LinkMissing),
         )
         assertEquals(
           unaffected.map(_.name),
           Right("Book club"),
         )
 
+  test("a stranger follows a group's link as a guest, joining it signed in"):
+    served(): world =>
+      for
+        owner <- world.signUp("owner")
+        team  <- world.groups.create(owner.id, GroupDetails("Book club"))
+        code  <- world.groups.link(owner.id, team.id)
+        made  <- world
+          .service
+          .welcome(
+            code.toUpperCase(Locale.ROOT),
+            "Reader",
+          )
+        (guest, target, session) = made.toOption.get
+        found   <- world.auth.current(Some(session.token))
+        members <- world.groups.managed(owner.id)
+      yield
+        assertEquals(
+          (guest.username, guest.guest, target),
+          ("Reader", true, LinkTarget.Joining(team.id)),
+        )
+        assertEquals(found, Right(Some(guest)))
+        assertEquals(
+          members.flatMap(_.members.map(_.id)),
+          List(guest.id),
+        )
+
+  test("a stranger follows a resource's link as a guest, granted its access"):
+    served(): world =>
+      for
+        owner <- world.signUp("owner")
+        code  <- world.share(owner, Access.Edit)
+        made  <- world.service.welcome(code, "Reader")
+        held  <- world.accessOf(made.toOption.get._1)
+      yield
+        assertEquals(
+          made.map(_._2),
+          Right(LinkTarget.Sharing(book, Access.Edit)),
+        )
+        assertEquals(held, Some(Access.Edit))
+
+  test("a link that leads nowhere, or to nothing, makes no guest"):
+    served(): world =>
+      for
+        owner <- world.signUp("owner")
+        code  <- world.share(owner, Access.View)
+        wrong = otherThan(code)
+        gone <- world.share(
+          owner,
+          Access.View,
+          Resource("book", 404),
+        )
+        missing  <- world.service.welcome(wrong, "Reader")
+        orphaned <- world.service.welcome(gone, "Reader")
+        found    <- world.users.findByUsername("Reader")
+      yield
+        assertEquals(
+          missing.map(_._1),
+          Left(AuthRefusal.LinkMissing),
+        )
+        assertEquals(
+          orphaned.map(_._1),
+          Left(AuthRefusal.LinkMissing),
+        )
+        assertEquals(found, None)
+
+  test("strangers who try too many codes that lead nowhere pause guests alone"):
+    served(strangerGuesses = 2): world =>
+      for
+        owner <- world.signUp("owner")
+        other <- world.signUp("reader")
+        code  <- world.share(owner, Access.View)
+        wrong = otherThan(code)
+        _          <- world.service.welcome(wrong, "Guesser")
+        _          <- world.service.welcome(wrong, "Guesser")
+        paused     <- world.service.welcome(code, "Reader")
+        unaffected <- world.service.follow(other, code)
+      yield
+        assertEquals(
+          paused.map(_._1),
+          Left(AuthRefusal.GuestsPaused),
+        )
+        assertEquals(
+          unaffected,
+          Right(LinkTarget.Sharing(book, Access.View)),
+        )
+
+  test("strangers are held to their own allowance, never to a user's"):
+    served(guesses = 1, strangerGuesses = 3): world =>
+      for
+        owner <- world.signUp("owner")
+        code  <- world.share(owner, Access.View)
+        wrong = otherThan(code)
+        _      <- world.service.welcome(wrong, "Guesser")
+        _      <- world.service.welcome(wrong, "Guesser")
+        within <- world.service.welcome(code, "Reader")
+      yield assertEquals(
+        within.map(_._2),
+        Right(LinkTarget.Sharing(book, Access.View)),
+      )
+
+  test("nobody follows a link as a guest where guests are not let in"):
+    served(guests = false): world =>
+      for
+        owner   <- world.signUp("owner")
+        code    <- world.share(owner, Access.View)
+        refused <- world.service.welcome(code, "Reader")
+      yield
+        assertEquals(
+          refused.map(_._1),
+          Left(AuthRefusal.NoGuests),
+        )
+        assert(!world.service.welcoming)
+
 object LinkServiceSuite:
 
-  /** The one resource the tests' host application has, a book. */
   private val book = Resource("book", 1)
 
-  /** The names of the host's resources, which a link may lead to. */
   private val names = Map(book -> "Dune")
 
-  /**
-    * The stores and endpoints under test, over one fresh database, with the
-    * means to act as the users the tests sign up.
-    */
-  private final class World(val db: TestDb, send: SendRequest):
+  private def otherThan(code: String): String =
+    if code == "aaaa1" then "bbbb1" else "aaaa1"
+
+  private final class World
+    (
+      val db: TestDb,
+      val service: LinkService,
+      val auth: AuthService,
+    ):
+
+    val users = UserStore(TestDb.tables, db)
 
     val groups = GroupStore(TestDb.tables, db)
     val grants = GrantStore(TestDb.tables, db)
     val links  = LinkStore(TestDb.tables)
 
-    /** Registers a user, yielding them and their session cookie. */
-    def signUp(name: String): IO[(User, String)] = Fixtures.signUp(send, name)
+    def signUp(name: String): IO[User] = Fixtures.signUp(auth, name).map(_._1)
 
-    /** Where a link leads, as the user with the given session sees it. */
-    def preview(cookie: String, code: String): IO[Either[String, LinkPreview]] =
-      send(
-        basicRequest
-          .get(uri"http://test/api/invite-links/$code")
-          .cookie(AuthApi.sessionCookie, cookie),
-      ).map(read[LinkPreview])
-
-    /** Follows a link as the user with the given session. */
-    def follow(cookie: String, code: String): IO[Either[String, LinkTarget]] =
-      send(
-        basicRequest
-          .post(uri"http://test/api/invite-links/$code")
-          .cookie(AuthApi.sessionCookie, cookie),
-      ).map(read[LinkTarget])
-
-    /** Gives a resource a link granting the given access, as a host would. */
     def share
       (
         creator: User,
@@ -219,26 +313,35 @@ object LinkServiceSuite:
       LinkTarget.Sharing(resource, access),
     ))
 
-    /** The access one user holds over a resource. */
     def accessOf(user: User, resource: Resource = book): IO[Option[Access]] =
       Permissions(groups, grants).access(user.id, resource)
 
-  /** Runs a check against the endpoints and stores over a fresh database. */
-  private def served(guesses: Int = 20)(check: World => IO[Unit]): IO[Unit] =
-    TestDb
-      .open(s"links-${ java.util.UUID.randomUUID }")
-      .use: db =>
-        val users   = UserStore(TestDb.tables, db)
-        val auth    = AuthService(users)
-        val groups  = GroupStore(TestDb.tables, db)
-        val grants  = GrantStore(TestDb.tables, db)
-        val service = LinkService(
+  /** Runs a check over a fresh database, letting guests in by default. */
+  private def served
+    (
+      guesses: Int = 20,
+      strangerGuesses: Int = 100,
+      guests: Boolean = true,
+    )
+    (check: World => IO[Unit])
+    : IO[Unit] = TestDb
+    .open("links")
+    .use: db =>
+      val auth = AuthService(
+        UserStore(TestDb.tables, db),
+        cheap.copy(guests = guests),
+      )
+      check(World(
+        db,
+        LinkService(
           LinkStore(TestDb.tables),
-          groups,
-          grants,
+          GroupStore(TestDb.tables, db),
+          GrantStore(TestDb.tables, db),
           db,
-          auth,
           resource => DBIO.successful(names.get(resource)),
           guesses = guesses,
-        )
-        check(World(db, serve(auth.api ++ service.api)))
+          guests = Some(auth),
+          strangerGuesses = strangerGuesses,
+        ),
+        auth,
+      ))

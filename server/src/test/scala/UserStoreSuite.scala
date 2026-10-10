@@ -1,6 +1,7 @@
 package com.alecdorrington.hecate
 package server
 
+import Fixtures.register
 import cats.effect.IO
 import cats.syntax.all.*
 import munit.CatsEffectSuite
@@ -8,7 +9,6 @@ import slick.jdbc.H2Profile.api.*
 
 class UserStoreSuite extends CatsEffectSuite:
 
-  /** Runs a check against a store backed by a fresh in-memory database. */
   private def withStore(name: String)(check: UserStore => IO[Unit]): IO[Unit] =
     TestDb.users(s"users-$name").use(check)
 
@@ -26,6 +26,17 @@ class UserStoreSuite extends CatsEffectSuite:
       users.register("alice", "hash") *>
         users.register("alice", "other").assertEquals(None)
 
+  test("a username is taken in any letter case, and kept as chosen"):
+    withStore("case"): users =>
+      for
+        user  <- users.register("Alice", "hash")
+        again <- users.register("aLICE", "other")
+        found <- users.findByUsername("ALICE")
+      yield
+        assertEquals(user.map(_.username), Some("Alice"))
+        assertEquals(again, None)
+        assertEquals(found.map(_.toUser), user)
+
   test("an unknown username is not found"):
     withStore("unknown")(_.findByUsername("nobody").assertEquals(None))
 
@@ -35,7 +46,7 @@ class UserStoreSuite extends CatsEffectSuite:
       .use: db =>
         val users = UserStore(TestDb.tables, db)
         for
-          user   <- users.register("alice", "hash").map(_.get)
+          user   <- register(users, "alice")
           _      <- users.openSession("secret", user.id, UserStoreSuite.soon)
           stored <- db.run(TestDb.tables.sessions.result)
           found  <- users.sessionUser("secret")
@@ -49,7 +60,7 @@ class UserStoreSuite extends CatsEffectSuite:
   test("an open session resolves to its user"):
     withStore("session"): users =>
       for
-        user <- users.register("alice", "hash").map(_.get)
+        user <- register(users, "alice")
         _    <- users.openSession("token", user.id, UserStoreSuite.soon)
         held <- users.sessionUser("token")
       yield assertEquals(held, Some(user))
@@ -60,7 +71,7 @@ class UserStoreSuite extends CatsEffectSuite:
   test("a closed session no longer resolves"):
     withStore("closed"): users =>
       for
-        user <- users.register("alice", "hash").map(_.get)
+        user <- register(users, "alice")
         _    <- users.openSession("token", user.id, UserStoreSuite.soon)
         _    <- users.closeSession("token")
         held <- users.sessionUser("token")
@@ -69,7 +80,7 @@ class UserStoreSuite extends CatsEffectSuite:
   test("an expired session no longer resolves"):
     withStore("expired"): users =>
       for
-        user <- users.register("alice", "hash").map(_.get)
+        user <- register(users, "alice")
         _    <- users.openSession("token", user.id, UserStoreSuite.past)
         held <- users.sessionUser("token")
       yield assertEquals(held, None)
@@ -77,7 +88,7 @@ class UserStoreSuite extends CatsEffectSuite:
   test("purging clears out the expired sessions and keeps the live ones"):
     withStore("sweep"): users =>
       for
-        user <- users.register("alice", "hash").map(_.get)
+        user <- register(users, "alice")
         _    <- users.openSession("stale", user.id, UserStoreSuite.past)
         _    <- users.openSession("fresh", user.id, UserStoreSuite.soon)
         _    <- users.purgeExpired
@@ -100,13 +111,16 @@ class UserStoreSuite extends CatsEffectSuite:
           "fresh",
           UserStoreSuite.soon,
         )
-        row   <- users.findById(user.id)
-        old1  <- users.sessionUser("laptop")
-        old2  <- users.sessionUser("phone")
-        fresh <- users.sessionUser("fresh")
+        row    <- users.find(user.id)
+        laptop <- users.sessionUser("laptop")
+        phone  <- users.sessionUser("phone")
+        fresh  <- users.sessionUser("fresh")
       yield
-        assertEquals(row.map(_.passwordHash), Some("new"))
-        assertEquals((old1, old2), (None, None))
+        assertEquals(
+          row.flatMap(_.passwordHash),
+          Some("new"),
+        )
+        assertEquals((laptop, phone), (None, None))
         assertEquals(fresh, Some(user))
 
   test("rehashing a password leaves every session where it was"):
@@ -115,11 +129,11 @@ class UserStoreSuite extends CatsEffectSuite:
         user <- users.register("alice", "old").map(_.get)
         _    <- users.openSession("laptop", user.id, UserStoreSuite.soon)
         _    <- users.rehash(user.id, "stronger")
-        row  <- users.findById(user.id)
+        row  <- users.find(user.id)
         open <- users.sessionUser("laptop")
       yield
         assertEquals(
-          row.map(_.passwordHash),
+          row.flatMap(_.passwordHash),
           Some("stronger"),
         )
         assertEquals(open, Some(user))
@@ -143,12 +157,15 @@ class UserStoreSuite extends CatsEffectSuite:
           "t2",
           UserStoreSuite.soon,
         )
-        row  <- users.findById(user.id)
+        row  <- users.find(user.id)
         left <- users.recoveryCodesLeft(user.id)
       yield
         assertEquals(first, Some(user))
         assertEquals(again, None)
-        assertEquals(row.map(_.passwordHash), Some("new"))
+        assertEquals(
+          row.flatMap(_.passwordHash),
+          Some("new"),
+        )
         assertEquals(left, 0)
 
   test(
@@ -172,18 +189,21 @@ class UserStoreSuite extends CatsEffectSuite:
           "t2",
           UserStoreSuite.soon,
         )
-        row  <- users.findById(user.id)
+        row  <- users.find(user.id)
         left <- users.recoveryCodesLeft(user.id)
       yield
         assertEquals((wrong, unknown), (None, None))
-        assertEquals(row.map(_.passwordHash), Some("old"))
+        assertEquals(
+          row.flatMap(_.passwordHash),
+          Some("old"),
+        )
         assertEquals(left, 1)
 
   test("users are looked up by identifier, with unknown identifiers left out"):
     withStore("named"): users =>
       for
-        alice <- users.register("alice", "hash").map(_.get)
-        bob   <- users.register("bob", "hash").map(_.get)
+        alice <- register(users, "alice")
+        bob   <- register(users, "bob")
         found <- users.byIds(List(alice.id, bob.id, alice.id, 9999L))
         none  <- users.byIds(List.empty)
       yield
@@ -213,8 +233,6 @@ class UserStoreSuite extends CatsEffectSuite:
 
 object UserStoreSuite:
 
-  /** An expiry time comfortably in the future. */
   private val soon = System.currentTimeMillis + 60000
 
-  /** An expiry time in the past. */
   private val past = System.currentTimeMillis - 1

@@ -5,11 +5,9 @@ import sbt.Keys._
 import sbtunidoc.BaseUnidocPlugin.autoImport.*
 import sbtunidoc.ScalaUnidocPlugin
 
-// This build is developed as part of a larger private project,
-// which includes it by reference and from which it is automatically synchronised.
-// Every project is prefixed with the library's name, so that none clashes with a host's own.
+// Project ids carry the library's name, so as not to clash with a host's.
 
-val scala3 = "3.8.4"
+val scala3 = "3.9.0"
 
 ThisBuild / scalaVersion := scala3
 
@@ -19,22 +17,31 @@ ThisBuild / scalacOptions ++= Seq(
   "-explain-cyclic",
 )
 
-/** The base package prefix shared across all subprojects. */
 val projectRoot = "com.alecdorrington.hecate"
 
-/**
-  * The model and the API endpoint definitions, shared by server and client.
-  * Cross-compiled for JVM and JS.
-  */
 lazy val hecateCore = projectMatrix
   .in(file("core"))
   .settings(
     name          := "hecate-core",
     packagePrefix := projectRoot,
 
-    // A matrix resolves its sources against the working directory, which is
-    // not this build's own when a host includes it by reference:
+    // Pinned, as a matrix resolves sources against the working directory, not this build.
     sourceDirectory := (ThisBuild / baseDirectory).value / "core" / "src",
+    Dependencies.circe,
+    Dependencies.munitCatsEffect,
+  )
+  .jvmPlatform(scalaVersions = Seq(scala3))
+  .jsPlatform(scalaVersions = Seq(scala3))
+
+lazy val hecateTapir = projectMatrix
+  .in(file("tapir"))
+  .dependsOn(hecateCore)
+  .settings(
+    name          := "hecate-tapir",
+    packagePrefix := s"$projectRoot.tapir",
+
+    // Pinned to this build's own base, as for the core.
+    sourceDirectory := (ThisBuild / baseDirectory).value / "tapir" / "src",
     Dependencies.tapir,
     Dependencies.circe,
     Dependencies.munitCatsEffect,
@@ -42,30 +49,34 @@ lazy val hecateCore = projectMatrix
   .jvmPlatform(scalaVersions = Seq(scala3))
   .jsPlatform(scalaVersions = Seq(scala3))
 
-/**
-  * The server half: password hashing, persistence and the API endpoint
-  * implementations. Storage is Slick over any JDBC profile, chosen by the host
-  * application rather than fixed here.
-  */
 lazy val hecateServer = project
   .in(file("server"))
   .dependsOn(hecateCore.jvm(scala3))
   .settings(
     name          := "hecate-server",
     packagePrefix := s"$projectRoot.server",
-    Dependencies.tapir,
     Dependencies.circe,
+    Dependencies.catsEffect,
+    Dependencies.database,
+    Dependencies.munitCatsEffect,
+  )
+
+lazy val hecateServerTapir = project
+  .in(file("server-tapir"))
+  .dependsOn(
+    hecateServer % "compile->compile;test->test",
+    hecateTapir.jvm(scala3),
+  )
+  .settings(
+    name          := "hecate-server-tapir",
+    packagePrefix := s"$projectRoot.server.tapir",
+    Dependencies.tapir,
     Dependencies.catsEffect,
     Dependencies.database,
     Dependencies.tapirStub,
     Dependencies.munitCatsEffect,
   )
 
-/**
-  * The client half: the browser-side sign-in and group state, driving the
-  * endpoints the server half implements. Headless, so that the host application
-  * owns all rendering and styling.
-  */
 lazy val hecateClient = project
   .in(file("client"))
   .dependsOn(hecateCore.js(scala3))
@@ -83,15 +94,21 @@ lazy val hecate = project
   .in(file("."))
   .enablePlugins(ScalaUnidocPlugin)
   .aggregate(
-    (hecateCore.projectRefs ++
-      Seq[ProjectReference](hecateServer, hecateClient)) *,
+    (hecateCore.projectRefs ++ hecateTapir.projectRefs ++ Seq[ProjectReference](
+      hecateServer,
+      hecateServerTapir,
+      hecateClient,
+    )) *,
   )
   .settings(
     publish / skip := true,
 
-    // Scaladoc is aggregated from the JVM side alone, as the JS side would
-    // only document the shared sources a second time:
-    ScalaUnidoc / unidoc / unidocProjectFilter :=
-      inProjects(hecateCore.jvm(scala3), hecateServer),
+    // The JVM side alone, as the JS side would document the shared sources twice.
+    ScalaUnidoc / unidoc / unidocProjectFilter := inProjects(
+      hecateCore.jvm(scala3),
+      hecateTapir.jvm(scala3),
+      hecateServer,
+      hecateServerTapir,
+    ),
     ScalaUnidoc / unidoc / scalacOptions ++= Seq("-project", "Hecate"),
   )

@@ -6,7 +6,7 @@ import io.circe.parser.decode
 import io.circe.syntax.*
 import munit.FunSuite
 
-class LinkSuite extends FunSuite:
+class InviteLinkSuite extends FunSuite:
 
   test("a code is five letters or digits, read without regard to case"):
     assertEquals(
@@ -45,8 +45,8 @@ class LinkSuite extends FunSuite:
     assertEquals(
       (LinkTarget.Joining(7): LinkTarget).asJson,
       Json.obj(
-        "kind"  -> "group".asJson,
-        "group" -> 7.asJson,
+        "kind"    -> "group".asJson,
+        "groupId" -> 7.asJson,
       ),
     )
     assertEquals(
